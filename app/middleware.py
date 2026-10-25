@@ -21,7 +21,7 @@ class JWTMiddleware(BaseHTTPMiddleware):
     This middleware is responsible for capturing logs
     """
     async def dispatch(self, request: Request, call_next):
-        start = time.time()
+        start = time.perf_counter()
         # Something explicitly disables logger in middleware
         inventory_logger.disabled = False
         data_activity_logger.disabled = False
@@ -34,12 +34,11 @@ class JWTMiddleware(BaseHTTPMiddleware):
             client_ip = request.client.host if request.client else "unknown"
             # client_ip = request.client.host
 
-        process_time = time.time() - start
-
         # Get token from cookies first (HttpOnly secure pattern), fallback to Authorization header
         token = request.cookies.get("fetch_auth_token")
         decoded_token = None
         fetch_user = 'unknown'
+        user_id = None
 
         if not token:
             auth_header = request.headers.get("authorization")
@@ -85,6 +84,7 @@ class JWTMiddleware(BaseHTTPMiddleware):
             refreshed_cookie = None  # (token, is_secure) -> set on the response after call_next
             with session_manager() as session:
                 user_object = session.query(User).filter(User.email == fetch_user).first()
+                user_id = user_object.id
                 audit_info = {
                     "name": f"{user_object.first_name} {user_object.last_name}",
                     "id": user_object.id,
@@ -134,12 +134,26 @@ class JWTMiddleware(BaseHTTPMiddleware):
                         samesite="lax",
                         max_age=900
                     )
+        process_time = time.perf_counter() - start
+        duration_ms = round(process_time * 1000, 1)
+
+        # Server-Timing shows server time in browser DevTools, separating it from network time
+        response.headers["Server-Timing"] = f"app;dur={duration_ms}"
+        response.headers["Timing-Allow-Origin"] = get_settings().VUE_HOST
+
+        # Route pattern (e.g. /items/{id}) groups requests and keeps barcode values out of the log
+        route = request.scope.get("route")
         request_log_dict = {
-            'url': request.url.path,
+            'route': getattr(route, "path", "unmatched"),
             'method': request.method,
             'response_status': response.status_code,
-            'process_time': process_time
+            'duration_ms': duration_ms,
+            'user_id': user_id,
         }
+        if duration_ms >= get_settings().SLOW_REQUEST_THRESHOLD_MS:
+            inventory_logger.warning({'event': 'slow_request', **request_log_dict})
+        elif get_settings().LOG_ALL_REQUEST_TIMES:
+            inventory_logger.info({'event': 'request_timing', **request_log_dict})
         # Sanitize headers to prevent token/cookie logging (NIST AU-9)
         sensitive_headers = {'authorization', 'cookie', 'set-cookie'}
         sanitized_headers = {

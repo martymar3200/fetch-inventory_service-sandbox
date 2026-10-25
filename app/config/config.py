@@ -25,6 +25,10 @@ class Settings(BaseSettings):
         "postgresql://user:pass@localhost:5432/inventory_service"
     )
     ENABLE_ORM_SQL_LOGGING: bool = False
+    # Request timing: requests at or over the threshold are logged as warnings.
+    # Set LOG_ALL_REQUEST_TIMES=true to also log every other request (high volume).
+    SLOW_REQUEST_THRESHOLD_MS: int = 500
+    LOG_ALL_REQUEST_TIMES: bool = False
     # Allowed origins for CORS (Requires precise start/end matching)
     ALLOWED_ORIGINS_REGEX: str = r"^https://.*\.example\.com$,^http://.*\.example\.com$"
     ALLOWED_ORIGINS: str = "http://127.0.0.1:8080,https://127.0.0.1:8080,http://localhost:8000,https://localhost:8000,http://localhost:3000,https://localhost:3000,http://localhost:4000"
