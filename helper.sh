@@ -43,6 +43,19 @@ seed_fake_data()
   docker exec -it fetch-inventory-api python -c "$SEED_FAKE_DATA";
 }
 
+seed() {
+  # Wipes the LOCAL inventory db and seeds it. See app/seed/local_seed.py
+  # Usage: ./helper.sh seed blank|demo
+  # Rebuild the inventory-api image first if seed code changed.
+  if [[ "$1" != "blank" && "$1" != "demo" ]]; then
+    echo "Usage: ./helper.sh seed blank|demo"
+    exit 1
+  fi
+  docker exec -it -w /code fetch-inventory-api python -m app.seed.local_seed "$1" || exit 1;
+  # The wipe drops the API's db connections; restart so it reconnects
+  docker restart fetch-inventory-api;
+}
+
 bootstrap-production() {
     EMAIL=$1
     FIRST_NAME=${2:-"System"}
