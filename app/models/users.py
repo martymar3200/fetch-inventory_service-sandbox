@@ -79,7 +79,6 @@ class User(Base):
         "AccessionJob",
         back_populates="assigned_user",
         primaryjoin="AccessionJob.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 2. Shelving Jobs (Assigned User)
@@ -87,7 +86,6 @@ class User(Base):
         "ShelvingJob",
         back_populates="assigned_user",
         primaryjoin="ShelvingJob.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 3. Verification Jobs (Assigned User)
@@ -95,7 +93,6 @@ class User(Base):
         "VerificationJob",
         back_populates="assigned_user",
         primaryjoin="VerificationJob.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 4. Pick Lists (Assigned User)
@@ -103,7 +100,6 @@ class User(Base):
         "PickList",
         back_populates="assigned_user",
         primaryjoin="PickList.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 5. Groups (Many-to-Many)
@@ -118,7 +114,6 @@ class User(Base):
         "RefileJob",
         back_populates="assigned_user",
         primaryjoin="RefileJob.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 7. Withdraw Jobs (Assigned User)
@@ -126,7 +121,6 @@ class User(Base):
         "WithdrawJob",
         back_populates="assigned_user",
         primaryjoin="WithdrawJob.assigned_user_id==User.id",
-        lazy="selectin"
     )
 
     # 8. Batch Uploads
@@ -137,7 +131,6 @@ class User(Base):
         "AccessionJob",
         back_populates="created_by",
         primaryjoin="AccessionJob.created_by_id==User.id",
-        lazy="selectin"
     )
 
     # 10. Created Verification Jobs
@@ -145,7 +138,6 @@ class User(Base):
         "VerificationJob",
         back_populates="created_by",
         primaryjoin="VerificationJob.created_by_id==User.id",
-        lazy="selectin"
     )
 
     # 11. Created Shelving Jobs
@@ -153,7 +145,6 @@ class User(Base):
         "ShelvingJob",
         back_populates="created_by",
         primaryjoin="ShelvingJob.created_by_id==User.id",
-        lazy="selectin"
     )
 
     # 12. Created Pick Lists
@@ -161,7 +152,6 @@ class User(Base):
         "PickList",
         back_populates="created_by",
         primaryjoin="PickList.created_by_id==User.id",
-        lazy="selectin"
     )
 
     # 13. Created Refile Jobs
@@ -169,7 +159,6 @@ class User(Base):
         "RefileJob",
         back_populates="created_by",
         primaryjoin="RefileJob.created_by_id==User.id",
-        lazy="selectin"
     )
     
     # 14. Created Withdraw Jobs
@@ -177,7 +166,6 @@ class User(Base):
         "WithdrawJob",
         back_populates="created_by",
         primaryjoin="WithdrawJob.created_by_id==User.id",
-        lazy="selectin"
     )
     
     # 15. Shelving Job Discrepancies
@@ -185,7 +173,6 @@ class User(Base):
         "ShelvingJobDiscrepancy",
         back_populates="assigned_user",
         primaryjoin="ShelvingJobDiscrepancy.assigned_user_id==User.id",
-        lazy="selectin"
     )
     
     # 16. Verification Changes
@@ -196,7 +183,6 @@ class User(Base):
         "MoveDiscrepancy",
         back_populates="assigned_user",
         primaryjoin="MoveDiscrepancy.assigned_user_id==User.id",
-        lazy="selectin"
     )
     
     # 18. Requests

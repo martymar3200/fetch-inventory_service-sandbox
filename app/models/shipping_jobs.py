@@ -58,13 +58,13 @@ class ShippingJob(Base):
     # Relationships
     assigned_user: Mapped[Optional["User"]] = relationship(
         "User",
-        backref=backref("shipping_jobs", lazy="selectin"),
+        backref="shipping_jobs",
         foreign_keys=[assigned_user_id],
         lazy="selectin"
     )
     created_by: Mapped[Optional["User"]] = relationship(
         "User",
-        backref=backref("created_shipping_jobs", lazy="selectin"),
+        backref="created_shipping_jobs",
         foreign_keys=[created_by_id],
         lazy="selectin"
     )

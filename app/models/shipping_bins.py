@@ -59,7 +59,7 @@ class ShippingBin(Base):
     items: Mapped[List["Item"]] = relationship("Item", backref=backref("shipping_bin", lazy="selectin"), foreign_keys="[Item.shipping_bin_id]", lazy="selectin")
     non_tray_items: Mapped[List["NonTrayItem"]] = relationship("NonTrayItem", backref=backref("shipping_bin", lazy="selectin"), foreign_keys="[NonTrayItem.shipping_bin_id]", lazy="selectin")
     
-    cleared_by: Mapped[Optional["User"]] = relationship("User", backref=backref("cleared_shipping_bins", lazy="selectin"), foreign_keys=[cleared_by_id], lazy="selectin")
+    cleared_by: Mapped[Optional["User"]] = relationship("User", backref="cleared_shipping_bins", foreign_keys=[cleared_by_id], lazy="selectin")
 
     # Composite Index for Auto-Clear Logic
     __table_args__ = (
