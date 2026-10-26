@@ -31,11 +31,12 @@ from app.models.verification_jobs import VerificationJob, VerificationJobStatus
 from app.models.trays import Tray
 from app.models.non_tray_items import NonTrayItem
 from app.models.items import Item
-from app.models.shelving_jobs import ShelvingJob, ShelvingJobStatus
+from app.models.shelving_jobs import ShelvingJob, ShelvingJobStatus, ShelvingMode
 from app.models.shelves import Shelf
 from app.models.shelf_positions import ShelfPosition
 from app.models.barcodes import Barcode
 from app.models.shelving_job_discrepancies import ShelvingJobDiscrepancy
+from app.models.move_discrepancies import MoveDiscrepancy
 from app.models.owners import Owner
 from app.models.size_class import SizeClass
 from app.models.shelf_types import ShelfType
@@ -163,6 +164,78 @@ def _create_or_get_shelving_container(
     )
     session.add(container)
     return container
+
+
+MOVE_MODES = (ShelvingMode.MoveShelf, ShelvingMode.MoveTrayItem)
+
+
+def _is_move_job(shelving_job: ShelvingJob) -> bool:
+    return shelving_job.mode in MOVE_MODES
+
+
+def _container_current_location(session: Session, container, container_type: str) -> Optional[str]:
+    """
+    Location the container is at before the move. Items report their tray's
+    shelf position, matching the legacy /items/move endpoint.
+    """
+    if container_type == "Item":
+        tray = session.get(Tray, container.tray_id) if container.tray_id else None
+        position_id = tray.shelf_position_id if tray else None
+    else:
+        position_id = container.shelf_position_id
+    position = session.get(ShelfPosition, position_id) if position_id else None
+    return position.location if position else None
+
+
+def _record_discrepancy(
+    session: Session,
+    shelving_job: ShelvingJob,
+    container,
+    container_type: str,
+    error: str,
+    owner_id: Optional[int] = None,
+    size_class_id: Optional[int] = None,
+    assigned_location: Optional[str] = None,
+    pre_assigned_location: Optional[str] = None,
+    move_destination: Optional[str] = None,
+):
+    """
+    Record a failed shelving action.
+    Move jobs write a MoveDiscrepancy (Shelving Move Discrepancy report);
+    all other jobs write a ShelvingJobDiscrepancy (Shelving Discrepancy report).
+    """
+    if _is_move_job(shelving_job):
+        record = MoveDiscrepancy(
+            # Items also carry their source tray, matching the legacy /items/move endpoint
+            tray_id=container.id if container_type == "Tray" else (
+                container.tray_id if container_type == "Item" else None
+            ),
+            non_tray_item_id=container.id if container_type == "NonTrayItem" else None,
+            item_id=container.id if container_type == "Item" else None,
+            container_type_id=container.container_type_id,
+            assigned_user_id=shelving_job.assigned_user_id,
+            owner_id=owner_id,
+            size_class_id=size_class_id,
+            original_assigned_location=_container_current_location(session, container, container_type),
+            current_assigned_location=move_destination,
+            error=error,
+        )
+    else:
+        # ShelvingJobDiscrepancy has no item column; only trays and non-tray items are recorded
+        if container_type == "Item":
+            return
+        record = ShelvingJobDiscrepancy(
+            shelving_job_id=shelving_job.id,
+            tray_id=container.id if container_type == "Tray" else None,
+            non_tray_item_id=container.id if container_type == "NonTrayItem" else None,
+            assigned_user_id=shelving_job.assigned_user_id,
+            owner_id=owner_id,
+            size_class_id=size_class_id,
+            assigned_location=assigned_location,
+            pre_assigned_location=pre_assigned_location,
+            error=error,
+        )
+    commit_record(session, record)
 
 
 @router.get("/", response_model=Page[ShelvingJobListOutput], dependencies=[Depends(RequiresPermission("can_access_shelving"))])
@@ -707,7 +780,36 @@ def reassign_container_location(
             ).scalars().first()
             
         if not dest_tray:
+            if _is_move_job(shelving_job):
+                _record_discrepancy(
+                    session, shelving_job, container, container_type,
+                    error=f"Not Shelved Discrepancy - Destination tray "
+                          f"{reassignment_input.destination_tray_barcode_value or reassignment_input.destination_tray_id} not found",
+                )
             raise NotFound(detail="Destination Tray not found")
+
+        dest_tray_position = (
+            session.get(ShelfPosition, dest_tray.shelf_position_id) if dest_tray.shelf_position_id else None
+        )
+        dest_tray_location = dest_tray_position.location if dest_tray_position else None
+
+        # Only items can go into a tray. Without a shelf in the request this used to fall
+        # through to the shelf path and fail with "Either shelf_id or shelf_barcode_value...".
+        if (
+            container_type != "Item"
+            and not reassignment_input.shelf_id
+            and not reassignment_input.shelf_barcode_value
+        ):
+            error = "Only items can be moved into a tray"
+            if _is_move_job(shelving_job):
+                _record_discrepancy(
+                    session, shelving_job, container, container_type,
+                    error=f"Container Type Discrepancy - {error}",
+                    owner_id=dest_tray.owner_id,
+                    size_class_id=dest_tray.size_class_id,
+                    move_destination=dest_tray_location,
+                )
+            raise ValidationException(detail=error)
 
         # Logic for Moving Item to Tray (Inline)
         # Ensure Item matches requirements
@@ -726,6 +828,15 @@ def reassign_container_location(
              item = container
              # Validations
              if not item.scanned_for_accession or not item.scanned_for_verification:
+                  if _is_move_job(shelving_job):
+                      _record_discrepancy(
+                          session, shelving_job, item, container_type,
+                          error=f"Not Accessioned Discrepancy - Tray Item barcode "
+                                f"{reassignment_input.container_barcode_value or item.id} has not been accessioned or verified",
+                          owner_id=dest_tray.owner_id,
+                          size_class_id=dest_tray.size_class_id,
+                          move_destination=dest_tray_location,
+                      )
                   raise ValidationException(detail="Item not accessioned or verified")
              
              src_tray = session.get(Tray, item.tray_id) if item.tray_id else None
@@ -800,6 +911,12 @@ def reassign_container_location(
     
     # Ensure container is a Tray or NonTrayItem for shelf assignment
     if container_type not in ["Tray", "NonTrayItem"]:
+        if _is_move_job(shelving_job):
+            _record_discrepancy(
+                session, shelving_job, container, container_type,
+                error=f"Container Type Discrepancy - {container_type} barcode "
+                      f"{reassignment_input.container_barcode_value or container.id} cannot be assigned directly to a shelf position",
+            )
         raise ValidationException(detail=f"Container type '{container_type}' cannot be assigned directly to a shelf position. Use 'destination_tray_id' for Item moves.")
 
     # get shelf
@@ -816,6 +933,12 @@ def reassign_container_location(
         shelf_barcode_join = session.execute(shelf_barcode_join).first() # Changed to first() as we expect one shelf
         
         if not shelf_barcode_join:
+            if _is_move_job(shelving_job):
+                _record_discrepancy(
+                    session, shelving_job, container, container_type,
+                    error=f"Not Shelved Discrepancy - Destination shelf with barcode "
+                          f"{reassignment_input.shelf_barcode_value} not found",
+                )
             raise NotFound(
                 detail=f"No shelves were found with barcode {reassignment_input.shelf_barcode_value}"
             )
@@ -837,6 +960,16 @@ def reassign_container_location(
     )
 
     if not shelf_position:
+        if _is_move_job(shelving_job):
+            missing_on_shelf = session.get(Shelf, shelf_id)
+            _record_discrepancy(
+                session, shelving_job, container, container_type,
+                error=f"Shelf Position Discrepancy - Shelf Position Number "
+                      f"{reassignment_input.shelf_position_number} does not exist on shelf {missing_on_shelf.location}",
+                owner_id=missing_on_shelf.owner_id,
+                size_class_id=missing_on_shelf.shelf_type.size_class_id,
+                move_destination=f"{missing_on_shelf.location}-{reassignment_input.shelf_position_number}",
+            )
         raise ValidationException(
             detail=f"""Shelf Position Number {reassignment_input.shelf_position_number} does not exist on shelf {shelf_id}"""
         )
@@ -886,12 +1019,6 @@ def reassign_container_location(
     shelving_job = session.execute(select(ShelvingJob).where(ShelvingJob.id == id)).scalars().first()
     shelf_type = shelf.shelf_type
     pre_assigned_location = None
-    if container_type == "Tray":
-        discrepancy_tray_id = container.id
-        discrepancy_non_tray_id = None
-    else: # container_type == "NonTrayItem"
-        discrepancy_tray_id = None
-        discrepancy_non_tray_id = container.id
 
     if container.shelf_position_proposed_id:
         # V2 FIX
@@ -916,18 +1043,15 @@ def reassign_container_location(
     ):
         barcode = container.barcode
 
-        new_shelving_job_discrepancy = ShelvingJobDiscrepancy(
-            shelving_job_id=id,
-            tray_id=discrepancy_tray_id,
-            non_tray_item_id=discrepancy_non_tray_id,
-            assigned_user_id=shelving_job.assigned_user_id,
+        _record_discrepancy(
+            session, shelving_job, container, container_type,
             owner_id=shelf.owner_id,
             size_class_id=shelf_type.size_class_id,
             assigned_location=shelf.location,
             pre_assigned_location=pre_assigned_location,
+            move_destination=shelf_position.location,
             error=f"""Not Accessioned Discrepancy - Container barcode {barcode.value} has not been accessioned""",
         )
-        commit_record(session, new_shelving_job_discrepancy)
         raise ValidationException(detail=f"Container barcode {barcode.value} has not been accessioned")
 
     # V2 FIX
@@ -945,55 +1069,46 @@ def reassign_container_location(
     ):
         barcode = container.barcode
 
-        new_shelving_job_discrepancy = ShelvingJobDiscrepancy(
-            shelving_job_id=id,
-            tray_id=discrepancy_tray_id,
-            non_tray_item_id=discrepancy_non_tray_id,
-            assigned_user_id=shelving_job.assigned_user_id,
+        _record_discrepancy(
+            session, shelving_job, container, container_type,
             owner_id=shelf.owner_id,
             size_class_id=shelf_type.size_class_id,
             assigned_location=shelf.location,
             pre_assigned_location=pre_assigned_location,
+            move_destination=shelf_position.location,
             error=f"""Not Accessioned Discrepancy - Container barcode {barcode.value} has not been verified""",
         )
-        commit_record(session, new_shelving_job_discrepancy)
         raise ValidationException(
             detail=f"Container barcode {barcode.value} has not been verified"
             )
 
     if shelf.available_space <= 0:
-        new_shelving_job_discrepancy = ShelvingJobDiscrepancy(
-            shelving_job_id=id,
-            tray_id=discrepancy_tray_id,
-            non_tray_item_id=discrepancy_non_tray_id,
-            assigned_user_id=shelving_job.assigned_user_id,
+        _record_discrepancy(
+            session, shelving_job, container, container_type,
             owner_id=shelf.owner_id,
             size_class_id=shelf_type.size_class_id,
             assigned_location=shelf.location,
             pre_assigned_location=pre_assigned_location,
+            move_destination=shelf_position.location,
             error=f"""Available Space Discrepancy - Shelf location {shelf.location}
                     has no available space""",
         )
-        commit_record(session, new_shelving_job_discrepancy)
         raise ValidationException(detail=f"Shelf ID {shelf.id} has no available space")
 
     if tray_exists or non_tray_exists:
         shelf_position_location = (
             shelf.location + "-" + str(reassignment_input.shelf_position_number)
         )
-        new_shelving_job_discrepancy = ShelvingJobDiscrepancy(
-            shelving_job_id=id,
-            tray_id=discrepancy_tray_id,
-            non_tray_item_id=discrepancy_non_tray_id,
-            assigned_user_id=shelving_job.assigned_user_id,
+        _record_discrepancy(
+            session, shelving_job, container, container_type,
             owner_id=shelf.owner_id,
             size_class_id=shelf_type.size_class_id,
             assigned_location=shelf_position.location,
             pre_assigned_location=pre_assigned_location,
+            move_destination=shelf_position.location,
             error=f"""Shelf Position Discrepancy - Shelf Position {shelf_position_location}
                     is already occupied""",
         )
-        commit_record(session, new_shelving_job_discrepancy)
         raise ValidationException(
             detail=f"""Shelf Position {shelf_position_location} is already occupied"""
         )
@@ -1076,29 +1191,20 @@ def reassign_container_location(
         else:
             # Create a Discrepancy
             discrepancy_error = "Unknown"
-            if container_type == "Tray":
-                discrepancy_tray_id = container.id
-                discrepancy_non_tray_id = None
-            else: # container_type == "NonTrayItem"
-                discrepancy_tray_id = None
-                discrepancy_non_tray_id = container.id
             if container.size_class_id != shelf_type.size_class_id:
                 discrepancy_error = f"""Size Discrepancy - Container size_id: {container.size_class_id} does not match Shelf size_id: {shelf_type.size_class_id}"""
             if container.owner_id != shelf.owner_id:
                 discrepancy_error = f"""Owner Discrepancy does not match Container owner_id: {container.owner_id} does not match Shelf owner_id: {shelf.owner_id}"""
 
-            new_shelving_job_discrepancy = ShelvingJobDiscrepancy(
-                shelving_job_id=id,
-                tray_id=discrepancy_tray_id,
-                non_tray_item_id=discrepancy_non_tray_id,
-                assigned_user_id=shelving_job.assigned_user_id,
+            _record_discrepancy(
+                session, shelving_job, container, container_type,
                 owner_id=shelf.owner_id,
                 size_class_id=shelf_type.size_class_id,
                 assigned_location=shelf_position.location,
                 pre_assigned_location=pre_assigned_location,
+                move_destination=shelf_position.location,
                 error=f"{discrepancy_error}",
             )
-            commit_record(session, new_shelving_job_discrepancy)
 
             raise ValidationException(
                 detail=f"Container Barcode {reassignment_input.container_barcode_value} "
