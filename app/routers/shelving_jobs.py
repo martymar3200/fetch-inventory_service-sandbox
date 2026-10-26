@@ -53,6 +53,8 @@ from app.config.exceptions import (
     InternalServerError,
     BadRequest,
 )
+from app.schemas.barcodes import BarcodeDetailReadOutput
+from app.schemas.container_types import ContainerTypeDetailReadOutput
 from app.helpers.owner_helpers import is_child_of_owner
 from app.helpers.system_setting_helpers import get_setting_value
 
@@ -699,7 +701,9 @@ def reassign_container_location(
             dest_tray = session.get(Tray, reassignment_input.destination_tray_id)
         elif reassignment_input.destination_tray_barcode_value:
             dest_tray = session.execute(
-                select(Tray).join(Barcode).where(Barcode.value == reassignment_input.destination_tray_barcode_value)
+                select(Tray)
+                .join(Barcode, Tray.barcode_id == Barcode.id)
+                .where(Barcode.value == reassignment_input.destination_tray_barcode_value)
             ).scalars().first()
             
         if not dest_tray:
@@ -770,9 +774,12 @@ def reassign_container_location(
              return ReAssignmentOutput(
                  id=sjc.id,
                  shelving_job_id=sjc.shelving_job_id,
-                 barcode=item_barcode.value if item_barcode else None,
+                 barcode=BarcodeDetailReadOutput.model_validate(item_barcode, from_attributes=True),
                  container_id=item.id,
-                 container_type=container_type,
+                 container_type=(
+                     ContainerTypeDetailReadOutput.model_validate(item.container_type, from_attributes=True)
+                     if item.container_type else None
+                 ),
                  shelf_position_id=None, # Item is in tray, not directly on shelf
                  shelf_position_number=None,
                  shelf_id=None,
@@ -780,7 +787,7 @@ def reassign_container_location(
                  destination_tray_id=dest_tray.id,
                  destination_tray_barcode_value=dest_tray.barcode.value if dest_tray.barcode else None,
                  shelved_dt=sjc.shelved_dt,
-                 scanned_for_shelving=sjc.scanned_for_shelving,
+                 scanned_for_shelving=True,
                  next_available_position=None, # Not applicable for item move
                  shelving_container_id=sjc.id
              )
