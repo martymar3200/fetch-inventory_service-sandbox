@@ -6,16 +6,15 @@ from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, Form, BackgroundTasks
-from fastapi_pagination import Page
 # CRITICAL FIX: Changed from .ext.sqlmodel to .ext.sqlalchemy
 from fastapi_pagination.ext.sqlalchemy import paginate
 # CRITICAL FIX: Replaced from sqlmodel import Session, select
-from sqlalchemy.orm import Session # Session is imported from sqlalchemy.orm now
+from sqlalchemy.orm import Session, selectinload # Session is imported from sqlalchemy.orm now
 from sqlalchemy import select, update, insert, text, not_, or_, func # select/update imported from sqlalchemy now
 from io import StringIO
 import pandas as pd
 from starlette import status
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 
 
@@ -23,6 +22,8 @@ from app.database.session import get_session, commit_record, session_manager
 from app.filter_params import SortParams, BatchUploadParams
 
 from app.logger import inventory_logger
+from app.pagination.requests import RequestListPagination
+from app.routers.requests import request_list_load_options
 from app.models.barcode_types import BarcodeType
 from app.models.barcodes import Barcode
 from app.models.batch_upload import BatchUpload, BatchUploadStatus
@@ -44,7 +45,7 @@ from app.schemas.batch_upload import (
     BatchUploadUpdateInput,
     LocationManagementSpreadSheetInput,
 )
-from app.sorting import BaseSorter
+from app.sorting import BatchUploadSorter
 from app.utilities import (
     validate_request_data,
     process_request_data,
@@ -66,8 +67,8 @@ router = APIRouter(
 )
 
 
-@router.get("/", response_model=Page[BatchUploadListOutput])
-async def get_batch_upload(
+@router.get("/", response_model=RequestListPagination[BatchUploadListOutput])
+def get_batch_upload(
     session: Session = Depends(get_session),
     batch_upload_type: str | None = None,
     uploaded_by: str | None = None,
@@ -77,11 +78,19 @@ async def get_batch_upload(
     """
     Batch upload endpoint to process barcodes for different operations.
     """
-    query = select(BatchUpload)
+    # Requests load only what request_count reads
+    query = select(BatchUpload).options(
+        selectinload(BatchUpload.requests).load_only(Request.deleted),
+        selectinload(BatchUpload.user),
+    )
 
     if batch_upload_type:
         if batch_upload_type == "request":
-            query = query.where(BatchUpload.withdraw_job_id.is_(None))
+            # Location Manager uploads also have no withdraw job, but have no uploader or requests
+            query = query.where(
+                BatchUpload.withdraw_job_id.is_(None),
+                or_(BatchUpload.user_id.isnot(None), BatchUpload.requests.any()),
+            )
         elif batch_upload_type == "withdraw":
             query = query.where(BatchUpload.withdraw_job_id.isnot(None))
     if uploaded_by:
@@ -98,25 +107,43 @@ async def get_batch_upload(
         query = query.where(BatchUpload.file_name == params.file_name)
     if params.file_type:
         query = query.where(BatchUpload.file_type.in_(params.file_type))
+    if params.file_type_search:
+        query = query.where(BatchUpload.file_type.icontains(params.file_type_search, autoescape=True))
+    if params.user_name_search:
+        user_subquery = select(User.id).where(
+            func.concat(User.first_name, " ", User.last_name).icontains(
+                params.user_name_search, autoescape=True
+            )
+        ).scalar_subquery()
+        query = query.where(BatchUpload.user_id.in_(user_subquery))
 
     # Validate and Apply sorting based on sort_params
     if sort_params.sort_by:
-        # Apply sorting using RequestSorter
-        sorter = BaseSorter(BatchUpload)
+        sorter = BatchUploadSorter(BatchUpload)
         query = sorter.apply_sorting(query, sort_params)
+
+    # Ties (and the unsorted list) need a fixed order, or rows repeat across pages
+    query = query.order_by(BatchUpload.id)
 
     return paginate(session, query)
 
 
 @router.get("/{id}", response_model=BatchUploadDetailOutput)
-async def get_batch_upload_detail(id: int, session: Session = Depends(get_session)):
+def get_batch_upload_detail(id: int, session: Session = Depends(get_session)):
     """
     Batch upload endpoint to process barcodes for different operations.
     """
     if not id:
         raise BadRequest(detail="Batch Upload ID is required")
 
-    batch_upload = session.get(BatchUpload, id)
+    batch_upload = session.execute(
+        select(BatchUpload)
+        .where(BatchUpload.id == id)
+        .options(
+            selectinload(BatchUpload.requests).options(*request_list_load_options()),
+            selectinload(BatchUpload.user),
+        )
+    ).scalars().first()
     if not batch_upload:
         raise NotFound(detail=f"Batch Upload ID {id} not found")
 
@@ -193,10 +220,8 @@ async def delete_batch_upload(id: int, session: Session = Depends(get_session)):
     session.delete(batch_upload)
     session.commit()
 
-    return JSONResponse(
-        status_code=status.HTTP_204_NO_CONTENT,
-        content=f"Batch Upload ID {id} and {len(batch_requests)} associated request(s) have been successfully deleted",
-    )
+    # A 204 can't carry a body: sending one raises after the response has started
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/location-management")

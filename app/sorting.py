@@ -9,6 +9,7 @@ from app.config.exceptions import BadRequest
 
 from app.models.aisles import Aisle
 from app.models.barcodes import Barcode
+from app.models.batch_upload import BatchUpload
 from app.models.buildings import Building
 from app.models.container_types import ContainerType
 from app.models.delivery_locations import DeliveryLocation
@@ -314,6 +315,32 @@ class RequestSorter(BaseSorter):
                 order_func(func.concat(User.first_name, " ", User.last_name)
                 )
             )
+        return super().custom_sort(query, sort_params, order_func)
+
+
+class BatchUploadSorter(BaseSorter):
+    """
+    Batch Upload List Sort By with specific sorting logic for related models.
+    """
+
+    def custom_sort(self, query: Query, sort_params, order_func):
+        """
+        Overrides the default sort to allow custom sorting for specific fields.
+        """
+        if sort_params.sort_by == "request_count":
+            request_count = (
+                select(func.count(Request.id))
+                .where(Request.batch_upload_id == BatchUpload.id, Request.deleted == False)
+                .correlate(BatchUpload)
+                .scalar_subquery()
+            )
+            return query.order_by(order_func(request_count))
+        # The table's Uploaded By column shows the name, not the id
+        if sort_params.sort_by == "user_id":
+            return query.outerjoin(User, BatchUpload.user_id == User.id).order_by(
+                nulls_last(order_func(func.concat(User.first_name, " ", User.last_name)))
+            )
+
         return super().custom_sort(query, sort_params, order_func)
 
 

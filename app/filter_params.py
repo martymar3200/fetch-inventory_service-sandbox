@@ -573,13 +573,18 @@ class BatchUploadParams:
         ),
         file_type: list[str] = Query(
             default=None, description="Type of the file to filter batch uploads."
-        )
+        ),
+        # Search filter params for server-side filtering
+        file_type_search: Optional[str] = Query(default=None, description="Search file type"),
+        user_name_search: Optional[str] = Query(default=None, description="Search uploader name"),
     ):
         self.status = status
         self.user_id = user_id
         self.withdraw_job_id = withdraw_job_id
         self.file_name = file_name
         self.file_type = file_type
+        self.file_type_search = file_type_search
+        self.user_name_search = user_name_search
 
 
 class MoveDiscrepancyParams:

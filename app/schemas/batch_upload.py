@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from pydantic import BaseModel, field_validator, PositiveInt, PositiveFloat, computed_field, ConfigDict
+from pydantic import BaseModel, field_validator, PositiveInt, PositiveFloat, ConfigDict
 
 from app.schemas.requests import RequestListOutput
 from app.schemas.users import UserDetailWriteOutput
@@ -62,15 +62,10 @@ class BatchUploadListOutput(BatchUploadBaseOutput):
     file_size: Optional[int] = None
     file_type: Optional[str] = None
     withdraw_job_id: Optional[int] = None
-    requests: Optional[List[RequestListOutput]] = None
+    request_count: int = 0
     user: Optional[UserDetailWriteOutput] = None
     create_dt: datetime
     update_dt: datetime
-
-    @computed_field(title='Request Count')
-    @property
-    def request_count(self) -> int:
-        return len(self.requests)
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -82,7 +77,6 @@ class BatchUploadListOutput(BatchUploadBaseOutput):
                 "file_size": 1000,
                 "file_type": "text/csv",
                 "withdraw_job_id": 1,
-                "requests": [{"...": "..."}],
                 "request_count": 1,
                 "create_dt": "2023-10-08T20:46:56.764426",
                 "update_dt": "2023-10-08T20:46:56.764398"

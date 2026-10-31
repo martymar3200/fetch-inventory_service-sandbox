@@ -60,6 +60,10 @@ class BatchUpload(Base): # <--- Inherit from Base
     
     # REMOVED: create_dt and update_dt are handled by the Base class.
 
+    @property
+    def request_count(self) -> int:
+        return sum(1 for request in self.requests if not request.deleted)
+
     # --- RELATIONSHIPS ---
     requests: Mapped[List["Request"]] = relationship(back_populates="batch_upload")
     withdraw_job: Mapped[Optional["WithdrawJob"]] = relationship(back_populates="batch_upload")
