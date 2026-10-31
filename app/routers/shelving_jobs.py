@@ -865,7 +865,13 @@ def reassign_container_location(
                   raise ValidationException(detail="Item not accessioned or verified")
              
              src_tray = session.get(Tray, item.tray_id) if item.tray_id else None
-             
+             src_tray_position = (
+                 session.get(ShelfPosition, src_tray.shelf_position_id)
+                 if src_tray and src_tray.shelf_position_id else None
+             )
+             src_tray_location = src_tray_position.location if src_tray_position else None
+             src_tray_barcode = src_tray.barcode.value if src_tray and src_tray.barcode else None
+
              # Perform Move
              item.tray_id = dest_tray.id
              item.size_class_id = dest_tray.size_class_id
@@ -897,16 +903,36 @@ def reassign_container_location(
                  destination_tray_id=dest_tray.id,
                  status="Shelved", # or Assiged
                  shelved_dt=update_dt,
-                 was_overridden=False # Assuming no overrides in this flow
+                 was_overridden=False, # Assuming no overrides in this flow
+                 # Move history: the item's source tray and where that tray was shelved
+                 original_shelf_position_id=src_tray_position.id if src_tray_position else None,
+                 original_location=src_tray_location,
+                 source_tray_id=src_tray.id if src_tray else None,
+                 source_tray_barcode=src_tray_barcode,
+                 moved_by_user_id=current_user.id,
              )
              session.add(sjc)
              session.commit()
              session.refresh(sjc)
-             
+
              # Construct Output (ReAssignmentOutput)
              # Need to fetch barcode rel
              item_barcode = session.get(Barcode, item.barcode_id) if item.barcode_id else None
-             
+
+             dest_tray_barcode = dest_tray.barcode.value if dest_tray.barcode else str(dest_tray.id)
+             log_audit_event(
+                 session,
+                 AuditEventType.CONTAINER_MOVED,
+                 f"{item_barcode.value if item_barcode else item.id} moved from tray "
+                 f"{src_tray_barcode or 'none'} ({src_tray_location or 'no location'}) to tray "
+                 f"{dest_tray_barcode} ({dest_tray_location or 'no location'})",
+                 job_type="shelving_jobs",
+                 job_id=id,
+                 entity_type="items",
+                 entity_id=item.id,
+             )
+             session.commit()
+
              return ReAssignmentOutput(
                  id=sjc.id,
                  shelving_job_id=sjc.shelving_job_id,
@@ -1253,6 +1279,8 @@ def reassign_container_location(
     if not _is_move_job(shelving_job):
         container.shelving_job_id = id
     old_shelf_position_id = container.shelf_position_id
+    old_shelf_position = session.get(ShelfPosition, old_shelf_position_id) if old_shelf_position_id else None
+    old_location = old_shelf_position.location if old_shelf_position else None
     container.shelf_position_id = shelf_position.id
 
     if reassignment_input.shelved_dt is not None:
@@ -1275,31 +1303,60 @@ def reassign_container_location(
     session.commit()
     session.refresh(container)
 
-    # Create ShelvingJobContainer record for unified container tracking
-    shelving_container = _create_or_get_shelving_container(
-        session=session,
-        shelving_job_id=id,
-        tray=container if container.container_type_id == 1 else None,
-        non_tray_item=container if container.container_type_id != 1 else None,
-        shelf_position=shelf_position,
-        status="Shelved"
-    )
-    session.commit()
-    session.refresh(shelving_container)
-
-    # Log shelving audit event
     barcode_obj = session.get(Barcode, container.barcode_id) if hasattr(container, 'barcode_id') else None
     barcode_val = barcode_obj.value if barcode_obj else str(container.id)
-    log_audit_event(
-        session,
-        AuditEventType.CONTAINER_SHELVED,
-        f"{barcode_val} shelved at position {shelf_position.position_number} on shelf {shelf.barcode.value if shelf.barcode else shelf.id}",
-        job_type="shelving_jobs",
-        job_id=id,
-        entity_type="trays" if container_type == "Tray" else "non_tray_items",
-        entity_id=container.id,
-    )
-    session.commit()
+
+    if _is_move_job(shelving_job):
+        # Move history: one record per move (moving the same container twice keeps both)
+        shelving_container = ShelvingJobContainer(
+            shelving_job_id=id,
+            tray_id=container.id if container.container_type_id == 1 else None,
+            non_tray_item_id=container.id if container.container_type_id != 1 else None,
+            actual_shelf_position_id=shelf_position.id,
+            shelved_dt=datetime.now(timezone.utc),
+            status=ShelvingJobContainerStatus.SHELVED,
+            original_shelf_position_id=old_shelf_position_id,
+            original_location=old_location,
+            moved_by_user_id=current_user.id,
+        )
+        session.add(shelving_container)
+        session.commit()
+        session.refresh(shelving_container)
+
+        log_audit_event(
+            session,
+            AuditEventType.CONTAINER_MOVED,
+            f"{barcode_val} moved from {old_location or 'no location'} to {shelf_position.location}",
+            job_type="shelving_jobs",
+            job_id=id,
+            entity_type="trays" if container_type == "Tray" else "non_tray_items",
+            entity_id=container.id,
+        )
+        session.commit()
+    else:
+        # Create ShelvingJobContainer record for unified container tracking
+        shelving_container = _create_or_get_shelving_container(
+            session=session,
+            shelving_job_id=id,
+            tray=container if container.container_type_id == 1 else None,
+            non_tray_item=container if container.container_type_id != 1 else None,
+            shelf_position=shelf_position,
+            status="Shelved"
+        )
+        session.commit()
+        session.refresh(shelving_container)
+
+        # Log shelving audit event
+        log_audit_event(
+            session,
+            AuditEventType.CONTAINER_SHELVED,
+            f"{barcode_val} shelved at position {shelf_position.position_number} on shelf {shelf.barcode.value if shelf.barcode else shelf.id}",
+            job_type="shelving_jobs",
+            job_id=id,
+            entity_type="trays" if container_type == "Tray" else "non_tray_items",
+            entity_id=container.id,
+        )
+        session.commit()
 
     # Calculate next available position for frontend auto-suggest
     from app.routers.shelves import get_next_available_position
