@@ -103,6 +103,23 @@ class ShelvingJobContainer(Base):
     )
     error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+    # Move history (Move jobs): where the container came from and who moved it.
+    # Text copies keep the "from" readable if the position or source tray is removed later.
+    original_shelf_position_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("shelf_positions.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    original_location: Mapped[Optional[str]] = mapped_column(String(175), nullable=True)
+    source_tray_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("trays.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    source_tray_barcode: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    moved_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True
+    )
+
     # --- RELATIONSHIPS ---
 
     shelving_job: Mapped["ShelvingJob"] = relationship(

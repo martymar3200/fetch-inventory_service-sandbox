@@ -235,7 +235,14 @@ class ShelvingJobContainerDetailOutput(BaseModel):
     shelved_dt: Optional[datetime] = None
     status: str
     was_overridden: bool = False
-    
+
+    # Move history (Move jobs only)
+    original_shelf_position_id: Optional[int] = None
+    original_location: Optional[str] = None
+    source_tray_id: Optional[int] = None
+    source_tray_barcode: Optional[str] = None
+    moved_by_user_id: Optional[int] = None
+
     @computed_field(title='Container Barcode')
     @property
     def container_barcode(self) -> Optional[str]:
