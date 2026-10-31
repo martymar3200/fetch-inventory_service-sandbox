@@ -579,10 +579,30 @@ def delete_shelving_job(id: int, session: Session = Depends(get_session)):
     Delete a shelving job by its ID.
     """
     shelving_job = session.get(ShelvingJob, id)
-    if shelving_job.status in ["Running", "Completed"]:
+    if not shelving_job:
+        raise NotFound(detail=f"Shelving Job ID {id} Not Found")
+
+    # Only jobs that were never started can be deleted. Deleting un-shelves the job's
+    # containers and removes its container records (including move history).
+    # Cancelled is allowed because the screens only cancel jobs that are still Created;
+    # the work check below catches a job cancelled after it did work.
+    if shelving_job.status not in [
+        ShelvingJobStatus.Created, ShelvingJobStatus.Assigned, ShelvingJobStatus.Cancelled
+    ]:
         raise ValidationException(
-            detail=f"""Shelving Job ID {id} status is in "
-                                         'Running' or 'Completed'"""
+            detail=f"Shelving Job ID {id} has been started ({ShelvingJobStatus(shelving_job.status).value}) and can't be deleted. "
+                   "Cancel it instead."
+        )
+
+    has_shelved_containers = session.execute(
+        select(ShelvingJobContainer.id)
+        .where(ShelvingJobContainer.shelving_job_id == id)
+        .where(ShelvingJobContainer.status == ShelvingJobContainerStatus.SHELVED)
+        .limit(1)
+    ).first() is not None
+    if has_shelved_containers or shelving_job.trays or shelving_job.non_tray_items:
+        raise ValidationException(
+            detail=f"Shelving Job ID {id} has shelved or moved containers and can't be deleted."
         )
 
     if shelving_job:
@@ -657,6 +677,11 @@ def delete_shelving_job(id: int, session: Session = Depends(get_session)):
                     delete(ShelvingJobDiscrepancy)
                     .where(ShelvingJobDiscrepancy.id.in_(discrepancy_ids))
                 )
+
+        # Removing the job's container list (e.g. a Shelve by List job's Pending containers).
+        # Deleted here because the relationship would otherwise try to null their job id.
+        for shelving_job_container in shelving_job.shelving_job_containers:
+            session.delete(shelving_job_container)
 
         log_audit_event(
             session,
