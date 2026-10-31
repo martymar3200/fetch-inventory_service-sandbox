@@ -15,7 +15,7 @@ from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import paginate
 # CRITICAL FIX: Replaced from sqlmodel import Session, select
 from sqlalchemy.orm import Session, aliased # Session is imported from sqlalchemy.orm now
-from sqlalchemy import select, func, union_all, literal, and_, asc, desc, distinct, case, cast, BigInteger
+from sqlalchemy import select, func, union_all, literal, and_, or_, asc, desc, distinct, case, cast, BigInteger
 from sqlalchemy.types import String
 from app.models.side_orientations import SideOrientation
 from starlette.responses import StreamingResponse, FileResponse
@@ -26,6 +26,7 @@ from app.logger import inventory_logger
 from app.config.exceptions import NotFound, BadRequest, InternalServerError
 from app.helpers.owner_helpers import get_owner_with_descendants
 from app.sorting import (
+    BaseSorter,
     RetrievalItemCountSorter,
     ShelvingJobDiscrepancySorter,
     MoveDiscrepancySorter,
@@ -79,6 +80,9 @@ from app.models.refile_items import RefileItem
 from app.models.refile_jobs import RefileJob
 from app.models.refile_non_tray_items import RefileNonTrayItem
 from app.models.requests import Request
+from app.models.shelving_job_containers import ShelvingJobContainer, ShelvingJobContainerStatus
+from app.models.shelving_jobs import ShelvingJob, ShelvingMode
+from app.models.trays import Tray
 from app.models.shipping_bins import ShippingBin
 from app.models.shipping_jobs import ShippingJob
 # --- ALL MODELS (Trigger SQLAlchemy Mapper Initialization) ---
@@ -95,6 +99,7 @@ from app.filter_params import (
     VerificationChangesParams,
     RetrievalCountParams,
     MoveDiscrepancyParams,
+    MoveHistoryParams,
     VerificationReportParams,
     WithdrawnItemsReportParams,
     ShippingBinsReportParams,
@@ -113,6 +118,7 @@ from app.schemas.reporting import (
     VerificationChangesOutput,
     RetrievalItemCountReadOutput,
     MoveDiscrepancyOutput,
+    MoveHistoryOutput,
     VerificationStatusReportOutput,
     WithdrawnItemsReportOutput,
     ShippingBinsReportOutput,
@@ -2112,6 +2118,151 @@ def get_verification_status_query(params: VerificationReportParams):
         query = query.where(Owner.name.ilike(f"%{params.owner_search}%"))
 
     return query
+
+
+def _move_history_query(params: MoveHistoryParams):
+    """Completed moves: Shelved shelving_job_containers rows from Move jobs."""
+    query = (
+        select(ShelvingJobContainer)
+        .join(ShelvingJob, ShelvingJobContainer.shelving_job_id == ShelvingJob.id)
+        .where(ShelvingJob.mode.in_([ShelvingMode.MoveShelf, ShelvingMode.MoveTrayItem]))
+        .where(ShelvingJobContainer.status == ShelvingJobContainerStatus.SHELVED)
+    )
+
+    if params.moved_by_user_id:
+        query = query.where(ShelvingJobContainer.moved_by_user_id.in_(params.moved_by_user_id))
+    if params.shelving_job_id:
+        query = query.where(ShelvingJobContainer.shelving_job_id == params.shelving_job_id)
+    if params.from_dt:
+        query = query.where(ShelvingJobContainer.shelved_dt >= params.from_dt)
+    if params.to_dt:
+        query = query.where(ShelvingJobContainer.shelved_dt <= params.to_dt)
+    if params.container_type == "Tray":
+        query = query.where(ShelvingJobContainer.tray_id.is_not(None))
+    elif params.container_type == "Non-Tray":
+        query = query.where(ShelvingJobContainer.non_tray_item_id.is_not(None))
+    elif params.container_type == "Item":
+        query = query.where(ShelvingJobContainer.item_id.is_not(None))
+    if params.owner_id:
+        query = query.where(or_(
+            ShelvingJobContainer.tray_id.in_(select(Tray.id).where(Tray.owner_id.in_(params.owner_id))),
+            ShelvingJobContainer.non_tray_item_id.in_(
+                select(NonTrayItem.id).where(NonTrayItem.owner_id.in_(params.owner_id))
+            ),
+            ShelvingJobContainer.item_id.in_(select(Item.id).where(Item.owner_id.in_(params.owner_id))),
+        ))
+    if params.barcode_value:
+        barcode_id = select(Barcode.id).where(Barcode.value == params.barcode_value)
+        query = query.where(or_(
+            ShelvingJobContainer.tray_id.in_(select(Tray.id).where(Tray.barcode_id.in_(barcode_id))),
+            ShelvingJobContainer.non_tray_item_id.in_(
+                select(NonTrayItem.id).where(NonTrayItem.barcode_id.in_(barcode_id))
+            ),
+            ShelvingJobContainer.item_id.in_(select(Item.id).where(Item.barcode_id.in_(barcode_id))),
+        ))
+
+    return query
+
+
+def _move_history_row(row: ShelvingJobContainer) -> dict:
+    container = row.tray or row.non_tray_item or row.item
+    container_type = "Tray" if row.tray else "Non-Tray" if row.non_tray_item else "Item"
+    destination_tray = row.destination_tray
+    if destination_tray:
+        destination_position = destination_tray.shelf_position
+    else:
+        destination_position = row.actual_shelf_position
+
+    return {
+        "id": row.id,
+        "shelving_job_id": row.shelving_job_id,
+        "shelved_dt": row.shelved_dt,
+        "barcode_value": container.barcode.value if container and container.barcode else None,
+        "container_type": container_type,
+        "source_tray_barcode": row.source_tray_barcode,
+        "original_location": row.original_location,
+        "destination_tray_barcode": (
+            destination_tray.barcode.value if destination_tray and destination_tray.barcode else None
+        ),
+        "destination_location": destination_position.location if destination_position else None,
+        "moved_by": row.moved_by_user.name if row.moved_by_user else None,
+        "owner": container.owner.name if container and container.owner else None,
+    }
+
+
+@router.get("/move-history/", response_model=Page[MoveHistoryOutput])
+def get_move_history_list(
+    session: Session = Depends(get_session),
+    params: MoveHistoryParams = Depends(),
+    sort_params: SortParams = Depends(),
+) -> list:
+    """
+    Returns a list of completed moves, newest first by default.
+    """
+    query = _move_history_query(params)
+
+    if sort_params.sort_by:
+        sorter = BaseSorter(ShelvingJobContainer)
+        query = sorter.apply_sorting(query, sort_params)
+    else:
+        query = query.order_by(ShelvingJobContainer.shelved_dt.desc(), ShelvingJobContainer.id.desc())
+
+    return paginate(session, query, transformer=lambda rows: [_move_history_row(row) for row in rows])
+
+
+@router.get("/move-history/download", response_class=StreamingResponse)
+def get_move_history_csv(
+    session: Session = Depends(get_session),
+    params: MoveHistoryParams = Depends(),
+):
+    """
+    Translates the list of completed moves to csv, returns binary for download
+    """
+    query = _move_history_query(params).order_by(
+        ShelvingJobContainer.shelved_dt.desc(), ShelvingJobContainer.id.desc()
+    )
+    rows = session.execute(query).scalars().all()
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "move_date",
+            "barcode",
+            "container_type",
+            "from_tray",
+            "from_location",
+            "to_tray",
+            "to_location",
+            "job_number",
+            "moved_by",
+            "owner",
+        ]
+    )
+    for row in rows:
+        move = _move_history_row(row)
+        writer.writerow(
+            [
+                move["shelved_dt"],
+                move["barcode_value"],
+                move["container_type"],
+                move["source_tray_barcode"],
+                move["original_location"],
+                move["destination_tray_barcode"],
+                move["destination_location"],
+                move["shelving_job_id"],
+                move["moved_by"],
+                move["owner"],
+            ]
+        )
+
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=move_history.csv"},
+    )
 
 
 @router.get("/verification-status", response_model=Page[VerificationStatusReportOutput])

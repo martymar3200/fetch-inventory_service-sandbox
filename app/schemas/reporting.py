@@ -367,6 +367,21 @@ class NestedSizeClassMoveDiscrepancy(BaseModel):
     short_name: Optional[str] = None
 
 
+class MoveHistoryOutput(BaseModel):
+    """One completed move (a shelving_job_containers row from a Move job)."""
+    id: int
+    shelving_job_id: int
+    shelved_dt: Optional[datetime] = None
+    barcode_value: Optional[str] = None
+    container_type: Optional[str] = None  # "Tray", "Non-Tray" or "Item"
+    source_tray_barcode: Optional[str] = None
+    original_location: Optional[str] = None
+    destination_tray_barcode: Optional[str] = None
+    destination_location: Optional[str] = None
+    moved_by: Optional[str] = None
+    owner: Optional[str] = None
+
+
 class MoveDiscrepancyOutput(MoveDiscrepancyBaseOutput):
     assigned_user: Optional[NestedUserMoveDiscrepancy] = None
     item: Optional[NestedItemMoveDiscrepancy] = None

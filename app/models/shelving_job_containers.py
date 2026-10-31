@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from app.models.non_tray_items import NonTrayItem
     from app.models.items import Item
     from app.models.shelf_positions import ShelfPosition
+    from app.models.users import User
 
 
 class ShelvingJobContainerStatus:
@@ -153,5 +154,10 @@ class ShelvingJobContainer(Base):
 
     actual_shelf_position: Mapped[Optional["ShelfPosition"]] = relationship(
         foreign_keys=[actual_shelf_position_id],
+        lazy="selectin"
+    )
+
+    moved_by_user: Mapped[Optional["User"]] = relationship(
+        foreign_keys=[moved_by_user_id],
         lazy="selectin"
     )

@@ -604,6 +604,26 @@ class MoveDiscrepancyParams:
         self.to_dt = to_dt
 
 
+class MoveHistoryParams:
+    def __init__(
+        self,
+        moved_by_user_id: list[int] = Query(default=None, description="ID of the user who made the move."),
+        owner_id: list[int] = Query(default=None, description="ID of the container's owner."),
+        container_type: Optional[str] = Query(default=None, description="Tray, Non-Tray or Item."),
+        barcode_value: Optional[str] = Query(default=None, description="Barcode of the moved container."),
+        shelving_job_id: Optional[int] = Query(default=None, description="ID of the Move job."),
+        from_dt: datetime = Query(default=None, description="Start move date to filter by."),
+        to_dt: datetime = Query(default=None, description="End move date to filter by."),
+    ):
+        self.moved_by_user_id = moved_by_user_id
+        self.owner_id = owner_id
+        self.container_type = container_type
+        self.barcode_value = barcode_value
+        self.shelving_job_id = shelving_job_id
+        self.from_dt = from_dt
+        self.to_dt = to_dt
+
+
 class VerificationReportParams:
     """
     Query params for Verification Status Report.
