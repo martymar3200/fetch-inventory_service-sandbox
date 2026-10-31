@@ -16,9 +16,12 @@ from app.database.session import get_session
 from app.pagination.requests import RequestListPagination
 from app.filter_params import SortParams, RequestFilterParams
 from app.logger import inventory_logger
+from app.models.aisles import Aisle
 from app.models.buildings import Building
 from app.models.delivery_locations import DeliveryLocation
+from app.models.ladders import Ladder
 from app.models.media_types import MediaType
+from app.models.modules import Module
 from app.models.priorities import Priority
 from app.models.request_types import RequestType
 from app.models.requests import Request, RequestStatus
@@ -27,6 +30,7 @@ from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
 from app.models.barcodes import Barcode
 from app.models.shelf_positions import ShelfPosition
 from app.models.shelves import Shelf
+from app.models.sides import Side
 from app.models.trays import Tray
 from app.models.users import User
 from app.schemas.requests import (
@@ -57,6 +61,65 @@ router = APIRouter(
 )
 
 
+def _shelf_position_location_loads(shelf_position_load):
+    """
+    ShelfPosition.location and internal_location walk up to the building, so without
+    these each distinct shelf on the page costs several extra queries.
+    """
+    side_load = (
+        shelf_position_load.selectinload(ShelfPosition.shelf)
+        .selectinload(Shelf.ladder)
+        .selectinload(Ladder.side)
+    )
+    return [
+        side_load.selectinload(Side.side_orientation),
+        side_load.selectinload(Side.aisle).selectinload(Aisle.module).selectinload(Module.building),
+    ]
+
+
+def request_list_load_options():
+    """
+    Eager loads for serializing RequestListOutput, on the request list and on a batch's
+    requests. Chains are tuned to exactly what RequestListOutput / NestedItemRequestList /
+    NonTrayItemNestedForRequest actually serialize.
+    """
+    item_load = selectinload(Request.item)
+    tray_load = item_load.selectinload(Item.tray)
+    non_tray_load = selectinload(Request.non_tray_item)
+    return [
+        # Item-side eager loads
+        item_load.selectinload(Item.size_class),
+        item_load.selectinload(Item.owner),
+        item_load.selectinload(Item.media_type),
+        item_load.selectinload(Item.barcode).selectinload(Barcode.type),
+        item_load.selectinload(Item.withdrawn_barcode).selectinload(Barcode.type),
+        # NestedBarcodeRequestList only exposes type_id (FK column), not the
+        # joined `type` relationship, so we stop one level shy here.
+        tray_load.selectinload(Tray.barcode),
+        *_shelf_position_location_loads(tray_load.selectinload(Tray.shelf_position)),
+        # NonTrayItem-side eager loads
+        non_tray_load.selectinload(NonTrayItem.size_class),
+        non_tray_load.selectinload(NonTrayItem.owner),
+        non_tray_load.selectinload(NonTrayItem.media_type),
+        non_tray_load.selectinload(NonTrayItem.barcode).selectinload(Barcode.type),
+        non_tray_load.selectinload(NonTrayItem.withdrawn_barcode).selectinload(Barcode.type),
+        *_shelf_position_location_loads(non_tray_load.selectinload(NonTrayItem.shelf_position)),
+        # These models eager-load their discrepancies by default; the list shows none
+        item_load.lazyload(Item.move_discrepancies),
+        tray_load.lazyload(Tray.move_discrepancies),
+        tray_load.lazyload(Tray.shelving_job_discrepancies),
+        non_tray_load.lazyload(NonTrayItem.move_discrepancies),
+        non_tray_load.lazyload(NonTrayItem.shelving_job_discrepancies),
+        # Request-level lookups exposed by RequestListOutput
+        selectinload(Request.building),
+        selectinload(Request.delivery_location),
+        selectinload(Request.request_type),
+        selectinload(Request.priority),
+        selectinload(Request.pick_list),
+        selectinload(Request.requested_by),
+    ]
+
+
 @router.get("/", response_model=RequestListPagination[RequestListOutput], dependencies=[Depends(RequiresPermission("can_access_request"))])
 def get_request_list(
     session: Session = Depends(get_session),
@@ -67,36 +130,7 @@ def get_request_list(
     Get a list of requests
     """
     # Create a query to select all Request from the database with eager loading.
-    # Chains are tuned to exactly what RequestListOutput / NestedItemRequestList /
-    # NonTrayItemNestedForRequest actually serialize -- avoid loading relationships
-    # whose target fields aren't on the list-response schema.
-    query = select(Request).where(Request.deleted == False).options(
-        # Item-side eager loads
-        selectinload(Request.item).selectinload(Item.size_class),
-        selectinload(Request.item).selectinload(Item.owner),
-        selectinload(Request.item).selectinload(Item.media_type),
-        selectinload(Request.item).selectinload(Item.barcode).selectinload(Barcode.type),
-        selectinload(Request.item).selectinload(Item.withdrawn_barcode).selectinload(Barcode.type),
-        # NestedBarcodeRequestList only exposes type_id (FK column), not the
-        # joined `type` relationship, so we stop one level shy here.
-        selectinload(Request.item).selectinload(Item.tray).selectinload(Tray.barcode),
-        selectinload(Request.item).selectinload(Item.tray).selectinload(Tray.shelf_position).selectinload(ShelfPosition.shelf),
-        # NonTrayItem-side eager loads
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.size_class),
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.owner),
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.media_type),
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.barcode).selectinload(Barcode.type),
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.withdrawn_barcode).selectinload(Barcode.type),
-        selectinload(Request.non_tray_item).selectinload(NonTrayItem.shelf_position).selectinload(ShelfPosition.shelf),
-        # Request-level lookups exposed by RequestListOutput
-        selectinload(Request.building),
-        selectinload(Request.delivery_location),
-        selectinload(Request.request_type),
-        selectinload(Request.priority),
-        selectinload(Request.pick_list),
-        # Note: Request.requested_by is NOT eager-loaded here -- RequestListOutput
-        # does not expose it. Detail endpoint still loads it where needed.
-    )
+    query = select(Request).where(Request.deleted == False).options(*request_list_load_options())
 
     if params.id:
         query = query.where(Request.id == params.id)

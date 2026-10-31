@@ -399,7 +399,7 @@ class RequestListOutput(RequestBaseOutput):
     priority: Optional[PriorityNestedForRequest] = None
     delivery_location: Optional[DeliveryLocationNestedForRequest] = None
     request_type: Optional[RequestTypeNestedForRequest] = None
-    building: Optional[BuildingDetailReadOutput] = None
+    building: Optional[BuildingNestedForRequest] = None
     pick_list: Optional[NestedPickListForRequest] = None
     create_dt: Optional[datetime] = None
     update_dt: Optional[datetime] = None
