@@ -718,9 +718,13 @@ def complete_shelving_job(shelving_job_id: int, audit_info: dict):
                 .values(last_transition=datetime.now(timezone.utc))
             )
             
+            # Only items waiting to be shelved become In. Items that are Out, Requested,
+            # on a pick list, etc. keep their status (and aren't checked in to the ILS).
             if shelving_job.trays:
                 for tray in shelving_job.trays:
                     for item in tray.items:
+                        if item.status not in (ItemStatus.Verified, ItemStatus.Accessioned):
+                            continue
                         item.status = ItemStatus.In
                         session.add(item)
                         if getattr(item, 'barcode', None):
@@ -728,6 +732,8 @@ def complete_shelving_job(shelving_job_id: int, audit_info: dict):
             
             if shelving_job.non_tray_items:
                 for non_tray_item in shelving_job.non_tray_items:
+                    if non_tray_item.status not in (NonTrayItemStatus.Verified, NonTrayItemStatus.Accessioned):
+                        continue
                     non_tray_item.status = NonTrayItemStatus.In
                     session.add(non_tray_item)
                     if getattr(non_tray_item, 'barcode', None):

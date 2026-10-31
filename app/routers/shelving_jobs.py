@@ -1212,7 +1212,8 @@ def reassign_container_location(
             )
 
     # Checking and verifying Verification Job
-    if container.verification_job_id:
+    # A move doesn't shelve the container, so its verification job keeps its original shelving job
+    if container.verification_job_id and not _is_move_job(shelving_job):
         verification_job = session.get(VerificationJob, container.verification_job_id)
 
         if verification_job.shelving_job_id is None:
@@ -1222,7 +1223,10 @@ def reassign_container_location(
             session.refresh(verification_job)
 
     # only reassign actual, not proposed
-    container.shelving_job_id = id
+    # Move jobs keep the container linked to the job that first shelved it;
+    # complete_shelving_job processes every container linked to the job.
+    if not _is_move_job(shelving_job):
+        container.shelving_job_id = id
     old_shelf_position_id = container.shelf_position_id
     container.shelf_position_id = shelf_position.id
 
