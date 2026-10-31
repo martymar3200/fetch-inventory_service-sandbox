@@ -98,11 +98,13 @@ def get_request_list(
         # does not expose it. Detail endpoint still loads it where needed.
     )
 
+    if params.id:
+        query = query.where(Request.id == params.id)
     if params.queue:
         # only return unfulfilled requests
         query = query.where(Request.fulfilled == False)
     if params.requestor_name:
-        query = query.where(Request.requestor_name.like(f"%{params.requestor_name}%"))
+        query = query.where(Request.requestor_name.icontains(params.requestor_name, autoescape=True))
     if params.request_type_id:
         query = query.where(Request.request_type_id.in_(params.request_type_id))
     if params.request_type:
@@ -124,7 +126,7 @@ def get_request_list(
     if params.to_dt:
         query = query.where(Request.create_dt <= params.to_dt)
     if params.building_id:
-        query = query.where(Request.building_id == params.building_id)
+        query = query.where(Request.building_id.in_(params.building_id))
     if params.building_name:
         building_subquery = select(Building.id).where(
             Building.name.in_(params.building_name)
@@ -133,18 +135,18 @@ def get_request_list(
     if params.unassociated_pick_list:
         query = query.where(Request.pick_list_id == None)
         
-    # Barcode Value Logic (V2 Conversion) - Now uses starts-with matching
+    # Barcode Value Logic (V2 Conversion) - Now uses case-insensitive starts-with matching
     if params.barcode_value:
         item_id_subquery = (
             select(Item.id)
             .join(Barcode, Barcode.id == Item.barcode_id)
-            .where(Barcode.value.like(f"{params.barcode_value}%"))
+            .where(Barcode.value.istartswith(params.barcode_value, autoescape=True))
             .scalar_subquery()
         )
         non_tray_item_id_subquery = (
             select(NonTrayItem.id)
             .join(Barcode, Barcode.id == NonTrayItem.barcode_id)
-            .where(Barcode.value.like(f"{params.barcode_value}%"))
+            .where(Barcode.value.istartswith(params.barcode_value, autoescape=True))
             .scalar_subquery()
         )
         
@@ -201,7 +203,7 @@ def get_request_list(
             )
         )
     if params.external_request_id:
-        query = query.where(Request.external_request_id.like(f"{params.external_request_id}%"))
+        query = query.where(Request.external_request_id.istartswith(params.external_request_id, autoescape=True))
     if params.priority_id:
         query = query.where(Request.priority_id.in_(params.priority_id))
     if params.priority:
@@ -222,20 +224,18 @@ def get_request_list(
         )
     if params.item_location:
         # Search both items (in trays) and non-tray items
-        # Use ilike for case-insensitive contains matching to handle formatted display values
-        # The display shows abbreviated sides (R/L) but database stores full names (Right/Left)
-        search_pattern = f"%{params.item_location}%"
+        # Case-insensitive contains matching on the location as displayed (sides are R/L)
         item_location_subquery = (
             select(Item.id)
             .join(Tray, Tray.id == Item.tray_id)
             .join(ShelfPosition, ShelfPosition.id == Tray.shelf_position_id)
-            .where(ShelfPosition.location.ilike(search_pattern))
+            .where(ShelfPosition.location.icontains(params.item_location, autoescape=True))
             .distinct().scalar_subquery()
         )
         non_tray_location_subquery = (
             select(NonTrayItem.id)
             .join(ShelfPosition, ShelfPosition.id == NonTrayItem.shelf_position_id)
-            .where(ShelfPosition.location.ilike(search_pattern))
+            .where(ShelfPosition.location.icontains(params.item_location, autoescape=True))
             .distinct().scalar_subquery()
         )
         query = query.where(
@@ -248,7 +248,7 @@ def get_request_list(
         non_tray_item_location_subquery = (
             select(NonTrayItem.id)
             .join(ShelfPosition, ShelfPosition.id == NonTrayItem.shelf_position_id)
-            .where(ShelfPosition.location.ilike(f"%{params.non_tray_item_location}%"))
+            .where(ShelfPosition.location.icontains(params.non_tray_item_location, autoescape=True))
             .distinct().scalar_subquery()
         )
         query = query.where(

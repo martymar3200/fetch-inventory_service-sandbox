@@ -227,10 +227,15 @@ class RequestFilterParams:
 
     def __init__(
         self,
+        id: Optional[int] = Query(
+            default=None, ge=1, le=9223372036854775807, description="Request ID to filter by."
+        ),
         status: List[RequestStatus] = Query(
             default=None, description="Status to filter by."
         ),
-        building_id: Optional[int] = None,
+        building_id: List[int] = Query(
+            default=None, description="Building IDs to filter by."
+        ),
         building_name: list[str] = Query(
             default=None, description="Building name to " "filter by."
         ),
@@ -275,6 +280,7 @@ class RequestFilterParams:
         from_dt: Optional[datetime] = None,
         to_dt: Optional[datetime] = None,
     ):
+        self.id = id
         self.status = status
         self.item_status = item_status
         self.building_id = building_id
