@@ -261,6 +261,9 @@ def get_request_list(
         sorter = RequestSorter(Request)
         query = sorter.apply_sorting(query, sort_params)
 
+    # Ties (and the unsorted list) need a fixed order, or rows repeat across pages
+    query = query.order_by(Request.id)
+
     return paginate(session, query)
 
 

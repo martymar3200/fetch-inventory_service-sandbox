@@ -1,9 +1,9 @@
 from operator import or_
 
-from sqlalchemy import asc, desc, func, inspect, case, Text, Integer, nulls_last
+from sqlalchemy import asc, desc, func, inspect, case, cast, Text, Integer, nulls_last
 from sqlalchemy.types import Enum as enum
 from sqlalchemy.orm import Query, aliased
-from sqlalchemy.sql import union_all, select
+from sqlalchemy.sql import select
 
 from app.config.exceptions import BadRequest
 
@@ -16,6 +16,7 @@ from app.models.item_withdrawals import ItemWithdrawal
 from app.models.items import Item
 from app.models.ladders import Ladder
 from app.models.media_types import MediaType
+from app.models.modules import Module
 from app.models.move_discrepancies import MoveDiscrepancy
 from app.models.non_tray_Item_withdrawal import NonTrayItemWithdrawal
 from app.models.non_tray_items import NonTrayItem
@@ -32,6 +33,8 @@ from app.models.shelf_types import ShelfType
 from app.models.shelves import Shelf
 from app.models.shelving_job_discrepancies import ShelvingJobDiscrepancy
 from app.models.shelving_jobs import ShelvingJob
+from app.models.side_orientations import SideOrientation
+from app.models.sides import Side
 from app.models.size_class import SizeClass
 from app.models.trays import Tray
 from app.models.users import User
@@ -212,37 +215,57 @@ class RequestSorter(BaseSorter):
             tray_alias = aliased(Tray)
             non_tray_item_alias = aliased(NonTrayItem)
             shelf_position_alias = aliased(ShelfPosition)
+            shelf_alias = aliased(Shelf)
+            ladder_alias = aliased(Ladder)
+            side_alias = aliased(Side)
+            side_orientation_alias = aliased(SideOrientation)
+            aisle_alias = aliased(Aisle)
+            module_alias = aliased(Module)
+            building_alias = aliased(Building)
 
-            # Subquery to unify shelf positions from Items (via Tray) and NonTrayItems
-            location_subquery = union_all(
-                # Items: Request -> Item -> Tray -> ShelfPosition
-                select(
-                    Request.id, tray_alias.shelf_position_id.label("shelf_position_id")
-                )
-                .join(item_alias, Request.item_id == item_alias.id)
-                .join(tray_alias, item_alias.tray_id == tray_alias.id),
-                # NonTrayItems: Request -> NonTrayItem -> ShelfPosition
-                select(
-                    Request.id,
-                    non_tray_item_alias.shelf_position_id.label("shelf_position_id"),
-                ).join(
+            query = (
+                query.outerjoin(item_alias, Request.item_id == item_alias.id)
+                .outerjoin(tray_alias, item_alias.tray_id == tray_alias.id)
+                .outerjoin(
                     non_tray_item_alias,
                     Request.non_tray_item_id == non_tray_item_alias.id,
-                ),
-            ).alias("location_map")
-
-            # Join the subquery with ShelfPosition and order by ShelfPosition.location
-            # Use nulls_last to keep NULL values at the end regardless of sort direction
-            query = (
-                query.outerjoin(location_subquery, Request.id == location_subquery.c.id)
+                )
                 .outerjoin(
                     shelf_position_alias,
-                    location_subquery.c.shelf_position_id == shelf_position_alias.id,
+                    shelf_position_alias.id
+                    == func.coalesce(
+                        tray_alias.shelf_position_id,
+                        non_tray_item_alias.shelf_position_id,
+                    ),
                 )
-                .order_by(nulls_last(order_func(shelf_position_alias.location)))
+                .outerjoin(shelf_alias, shelf_position_alias.shelf_id == shelf_alias.id)
+                .outerjoin(ladder_alias, shelf_alias.ladder_id == ladder_alias.id)
+                .outerjoin(side_alias, ladder_alias.side_id == side_alias.id)
+                .outerjoin(
+                    side_orientation_alias,
+                    side_alias.side_orientation_id == side_orientation_alias.id,
+                )
+                .outerjoin(aisle_alias, side_alias.aisle_id == aisle_alias.id)
+                .outerjoin(module_alias, aisle_alias.module_id == module_alias.id)
+                .outerjoin(building_alias, module_alias.building_id == building_alias.id)
             )
 
-            return query
+            # Sort part by part so aisle 2 comes before aisle 10; the location text
+            # would sort 10 first. Rows with no location stay at the end either way.
+            return query.order_by(
+                *[
+                    nulls_last(order_func(part))
+                    for part in (
+                        building_alias.name,
+                        func.lpad(module_alias.module_number, 50, "0"),
+                        aisle_alias.aisle_number,
+                        cast(side_orientation_alias.name, Text),
+                        ladder_alias.ladder_number,
+                        shelf_alias.shelf_number,
+                        shelf_position_alias.position_number,
+                    )
+                ]
+            )
         # if sort_params.sort_by == "status":
         #     # Aliases for clarity
         #     item_alias = aliased(Item)
@@ -266,15 +289,16 @@ class RequestSorter(BaseSorter):
         #     query = query.order_by(order_func(status_column))
         #
         #     return query
+        # These lookups are optional on a request: outer joins keep the rows that have none
         if sort_params.sort_by == "request_type":
-            return query.join(RequestType).order_by(order_func(RequestType.type))
+            return query.outerjoin(RequestType).order_by(nulls_last(order_func(RequestType.type)))
         if sort_params.sort_by == "building_name":
-            return query.join(Building).order_by(order_func(Building.name))
+            return query.outerjoin(Building).order_by(nulls_last(order_func(Building.name)))
         if sort_params.sort_by == "priority":
-            return query.join(Priority).order_by(order_func(Priority.value))
+            return query.outerjoin(Priority).order_by(nulls_last(order_func(Priority.value)))
         if sort_params.sort_by == "delivery_location":
-            return query.join(DeliveryLocation).order_by(
-                order_func(DeliveryLocation.name)
+            return query.outerjoin(DeliveryLocation).order_by(
+                nulls_last(order_func(DeliveryLocation.name))
             )
         if sort_params.sort_by == "request_count":
             query = (
