@@ -17,7 +17,7 @@ from app.models.non_tray_item_retrieval_events import NonTrayItemRetrievalEvent
 from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
 from app.models.item_withdrawals import ItemWithdrawal
 from app.models.non_tray_Item_withdrawal import NonTrayItemWithdrawal
-from app.models.pick_lists import PickList
+from app.models.pick_lists import PickList, PickListStatus
 from app.models.requests import Request
 from app.models.tray_withdrawal import TrayWithdrawal
 from app.models.trays import Tray
@@ -48,6 +48,43 @@ router = APIRouter(
     prefix="/pick-lists",
     tags=["pick lists"],
 )
+
+# Status changes a pick list can make. Repeating the current status is allowed and changes nothing.
+ALLOWED_STATUS_CHANGES = {
+    "Created": {"Assigned", "Running"},
+    "Assigned": {"Created", "Running"},
+    "Running": {"Paused", "Completed"},
+    "Paused": {"Running"},
+    "Completed": set(),
+}
+
+
+def validate_status_change(session: Session, pick_list, new_status: str):
+    current_status = PickListStatus(pick_list.status).value
+
+    if new_status == current_status:
+        return
+
+    if new_status not in ALLOWED_STATUS_CHANGES[current_status]:
+        raise BadRequest(
+            detail=f"Pick List {pick_list.id} can not go from '{current_status}' to '{new_status}'"
+        )
+
+    if new_status == "Completed":
+        fulfilled_flags = session.execute(
+            select(Request.fulfilled)
+            .where(Request.pick_list_id == pick_list.id)
+            .where(Request.deleted == False)  # noqa: E712
+        ).scalars().all()
+
+        if not fulfilled_flags:
+            raise BadRequest(detail=f"Pick List {pick_list.id} has no items to complete")
+
+        unscanned = len([fulfilled for fulfilled in fulfilled_flags if not fulfilled])
+        if unscanned:
+            raise BadRequest(
+                detail=f"Pick List {pick_list.id} can not be completed: {unscanned} item(s) have not been scanned"
+            )
 
 
 def sort_order_priority(session: Session, pick_list, requests):
@@ -300,7 +337,10 @@ def update_pick_list(
 
         if not existing_pick_list:
             raise NotFound(detail=f"Pick List ID {id} Not Found")
-        
+
+        if pick_list.status:
+            validate_status_change(session, existing_pick_list, pick_list.status)
+
         # Capture original status and assigned user before changes
         original_status = existing_pick_list.status
         original_assigned_user_id = existing_pick_list.assigned_user_id
@@ -322,7 +362,8 @@ def update_pick_list(
             )
 
         items_to_sync = []
-        if pick_list.status == "Completed":
+        # Completing runs once: a repeat must not add retrieval events or check items in again
+        if pick_list.status == "Completed" and original_status != "Completed":
             request_ids = [
                 request_id
                 for (request_id,) in session.execute(

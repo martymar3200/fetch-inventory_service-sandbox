@@ -2,12 +2,16 @@
 The server enforces the pick list workflow. Offline replay, stale screens and staff sharing
 a job can all send requests the screens would normally prevent.
 """
+import uuid
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import func, select
 
 from app.main import app as fastapi_app
 from app.auth.dependencies import get_current_user_with_permissions
+from app.models.item_retrieval_events import ItemRetrievalEvent
 from app.models.items import Item, ItemStatus
 from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
 from app.models.requests import Request
@@ -79,3 +83,124 @@ def test_withdrawal_pick_list_makes_already_requested_items_scannable(staff, ses
     assert session.get(Request, non_tray_request).pick_list_id == pick_list_id
     assert _status(session, tray_item) == ItemStatus.PickList
     assert _status(session, non_tray_item) == NonTrayItemStatus.PickList
+
+
+def _new_pick_list(client, session, warehouse, count=1):
+    items = [warehouse.tray_item() for _ in range(count)]
+    request_ids = [_new_request(client, session, item, uuid.uuid4().hex[:10]) for item in items]
+    response = client.post("/pick-lists/", json={"request_ids": request_ids})
+    assert response.status_code == 201, response.text
+    return response.json()["id"], request_ids, items
+
+
+def _set_status(client, pick_list_id, status):
+    return client.patch(f"/pick-lists/{pick_list_id}", json={"status": status})
+
+
+def _scan(client, pick_list_id, request_id):
+    return client.patch(f"/pick-lists/{pick_list_id}/update_request/{request_id}", json={"status": "Out"})
+
+
+def _retrieval_events(session, pick_list_id):
+    session.expire_all()
+    return session.scalar(
+        select(func.count(ItemRetrievalEvent.id)).where(ItemRetrievalEvent.pick_list_id == pick_list_id)
+    )
+
+
+def _completed_pick_list(client, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(client, session, warehouse)
+    assert _set_status(client, pick_list_id, "Running").status_code == 200
+    assert _scan(client, pick_list_id, request_ids[0]).status_code == 200
+    assert _set_status(client, pick_list_id, "Completed").status_code == 200
+    return pick_list_id, request_ids, items
+
+
+@pytest.mark.parametrize("path", [
+    ["Running", "Paused", "Running"],
+    ["Assigned", "Created"],
+    ["Assigned", "Running"],
+])
+def test_allowed_status_changes(staff, session, warehouse, path):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+
+    for status in path:
+        response = _set_status(staff, pick_list_id, status)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == status
+
+
+@pytest.mark.parametrize("path,blocked", [
+    ([], "Paused"),
+    ([], "Completed"),
+    (["Assigned"], "Paused"),
+    (["Assigned"], "Completed"),
+    (["Running"], "Created"),
+    (["Running"], "Assigned"),
+    (["Running", "Paused"], "Completed"),
+    (["Running", "Paused"], "Created"),
+])
+def test_blocked_status_changes(staff, session, warehouse, path, blocked):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+    for status in path:
+        assert _set_status(staff, pick_list_id, status).status_code == 200
+    current = path[-1] if path else "Created"
+
+    response = _set_status(staff, pick_list_id, blocked)
+
+    assert response.status_code == 400
+    assert f"'{current}' to '{blocked}'" in response.json()["detail"]
+    assert staff.get(f"/pick-lists/{pick_list_id}").json()["status"] == current
+
+
+def test_completed_job_can_not_reopen(staff, session, warehouse):
+    pick_list_id, _, _ = _completed_pick_list(staff, session, warehouse)
+
+    assert _set_status(staff, pick_list_id, "Running").status_code == 400
+    assert staff.get(f"/pick-lists/{pick_list_id}").json()["status"] == "Completed"
+
+
+def test_complete_rejected_while_items_are_unscanned(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse, count=2)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+
+    response = _set_status(staff, pick_list_id, "Completed")
+
+    assert response.status_code == 400
+    assert "1 item(s) have not been scanned" in response.json()["detail"]
+    session.expire_all()
+    assert session.get(Request, request_ids[1]).fulfilled is False
+    assert _status(session, items[1]) == ItemStatus.PickList
+    assert staff.get(f"/pick-lists/{pick_list_id}").json()["status"] == "Running"
+    assert _retrieval_events(session, pick_list_id) == 0
+
+    assert _scan(staff, pick_list_id, request_ids[1]).status_code == 200
+    assert _set_status(staff, pick_list_id, "Completed").status_code == 200
+    assert _retrieval_events(session, pick_list_id) == 2
+
+
+def test_complete_rejected_with_no_items(staff, session, warehouse):
+    pick_list_id, request_ids, _ = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert staff.delete(f"/pick-lists/{pick_list_id}/remove_request/{request_ids[0]}").status_code == 200
+
+    response = _set_status(staff, pick_list_id, "Completed")
+
+    assert response.status_code == 400
+    assert "no items" in response.json()["detail"]
+
+
+def test_repeated_complete_changes_nothing(staff, session, warehouse, monkeypatch):
+    check_in = MagicMock()
+    monkeypatch.setattr("app.ils.tasks.check_in_picklist_item_async", check_in)
+    pick_list_id, _, _ = _completed_pick_list(staff, session, warehouse)
+    assert _retrieval_events(session, pick_list_id) == 1
+    assert check_in.call_count == 1
+
+    response = _set_status(staff, pick_list_id, "Completed")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "Completed"
+    assert _retrieval_events(session, pick_list_id) == 1
+    assert check_in.call_count == 1
