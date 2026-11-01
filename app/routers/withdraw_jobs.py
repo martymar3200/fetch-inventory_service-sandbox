@@ -197,7 +197,15 @@ def update_withdraw_job(
     # Capture original status before changes
     original_status = existing_withdraw_job.status
     original_assigned_user_id = existing_withdraw_job.assigned_user_id
-    
+
+    # A completed job's items are already withdrawn, so it can't reopen or take on more
+    if original_status == "Completed" and (
+        withdraw_job_input.status not in (None, "Completed")
+        or withdraw_job_input.create_pick_list
+        or withdraw_job_input.add_to_picklist
+    ):
+        raise BadRequest(detail=f"Withdraw job id {id} is already completed")
+
     # Handle auto-assignment when user starts job
     if withdraw_job_input.status:
         auto_assign_on_start(
@@ -207,7 +215,7 @@ def update_withdraw_job(
         )
     
     # Handle status update when manager assigns user
-    if withdraw_job_input.assigned_user_id is not None and not withdraw_job_input.status:
+    if "assigned_user_id" in withdraw_job_input.model_fields_set and not withdraw_job_input.status:
         update_status_on_assignment(
             existing_withdraw_job,
             withdraw_job_input.assigned_user_id,
@@ -336,7 +344,7 @@ def update_withdraw_job(
             update(WithdrawJob).filter(WithdrawJob.id == id).values(pick_list_id=pick_list.id)
         )
 
-    if withdraw_job_input.status == "Completed":
+    if withdraw_job_input.status == "Completed" and original_status != "Completed":
         tray_ids = [item.tray_id for item in existing_withdraw_job.items]
         item_ids = [item.id for item in existing_withdraw_job.items]
         item_barcodes = [item.barcode_id for item in existing_withdraw_job.items]
@@ -513,7 +521,7 @@ def update_withdraw_job(
                 if shelf_position_id:
                     update_shelf_space_after_non_tray(session, None, None, shelf_position_id)
 
-    if withdraw_job_input.status:
+    if withdraw_job_input.status and withdraw_job_input.status != original_status:
         if withdraw_job_input.run_timestamp:
             existing_withdraw_job = manage_transition(
                 existing_withdraw_job, withdraw_job_input
@@ -530,10 +538,17 @@ def update_withdraw_job(
         exclude={"run_timestamp", "create_pick_list", "add_to_picklist"},
     )
 
-    for key, value in mutated_data.items():
-       if withdraw_job_input.status and withdraw_job_input.status != original_status:
+    # Only what the screen changes is saved. The input's other fields, such as run_time
+    # and created_by_id, stay ignored as they have been since the 2.0 release.
+    for key in ("status", "assigned_user_id"):
+        if key in mutated_data:
+            setattr(existing_withdraw_job, key, mutated_data[key])
+
+    if withdraw_job_input.status and withdraw_job_input.status != original_status:
         existing_withdraw_job.last_transition = datetime.now(timezone.utc)
-        
+
+    existing_withdraw_job.update_dt = updated_dt
+
     session.add(existing_withdraw_job)
     session.commit()
     session.refresh(existing_withdraw_job)
@@ -591,6 +606,9 @@ def delete_withdraw_job(job_id: int, session: Session = Depends(get_session)):
 
     if not withdraw_job:
         raise NotFound(detail=f"Withdraw job id {job_id} not found")
+
+    if withdraw_job.status == "Completed":
+        raise BadRequest(detail=f"Withdraw job id {job_id} is already completed")
 
     withdrawal_models = [ItemWithdrawal, NonTrayItemWithdrawal, TrayWithdrawal]
     for model in withdrawal_models:
