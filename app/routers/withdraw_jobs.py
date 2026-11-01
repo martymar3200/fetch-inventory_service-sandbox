@@ -286,6 +286,8 @@ def update_withdraw_job(
                         Request.fulfilled == False,
                     ).values(pick_list_id=pick_list.id, update_dt=updated_dt)
                 )
+                # on the pick list now, so it has to be scannable like the rest
+                item_ids.append(item.id)
 
         for non_tray_item in existing_withdraw_job.non_tray_items:
             if not building_id:
@@ -317,6 +319,7 @@ def update_withdraw_job(
                         Request.fulfilled == False,
                     ).values(pick_list_id=pick_list.id, update_dt=updated_dt)
                 )
+                non_tray_item_ids.append(non_tray_item.id)
 
         if new_request:
             session.bulk_save_objects(new_request)
