@@ -38,7 +38,8 @@ from app.config.exceptions import (
     InternalServerError,
 )
 from app.sorting import PickListSorter
-from app.utilities import get_location, manage_transition, check_batch_completion
+from app.routers.requests import request_list_load_options
+from app.utilities import manage_transition, check_batch_completion
 from app.helpers.system_setting_helpers import get_setting_value
 
 from app.auth.dependencies import RequiresPermission, get_current_user_with_permissions
@@ -118,16 +119,31 @@ def get_requests_for_pick_list(session: Session, request_ids: list[int]):
     return requests
 
 
-def sort_order_priority(session: Session, pick_list, requests):
+def pick_list_detail(session: Session, pick_list):
+    """
+    The pick list with its requests in walking order. Loads them all at once: looking up
+    each request's item, tray and location one at a time grows with the size of the job.
+    """
+    requests = session.execute(
+        select(Request)
+        .where(Request.pick_list_id == pick_list.id)
+        .options(*request_list_load_options())
+        .order_by(Request.id)
+    ).scalars().all()
+
+    return sort_order_priority(pick_list, requests)
+
+
+def sort_order_priority(pick_list, requests):
     request_data = []
     
     if requests:
         for request in requests:
             if request.item_id:
-                item = session.get(Item, request.item_id)
+                item = request.item
                 if not item or not item.tray_id:
                     continue
-                tray = session.get(Tray, item.tray_id)
+                tray = item.tray
 
                 if not tray:
                     continue
@@ -138,7 +154,7 @@ def sort_order_priority(session: Session, pick_list, requests):
                 shelf_position = tray.shelf_position
 
             elif request.non_tray_item_id:
-                non_try_item = session.get(NonTrayItem, request.non_tray_item_id)
+                non_try_item = request.non_tray_item
 
                 if not non_try_item:
                     continue
@@ -151,17 +167,13 @@ def sort_order_priority(session: Session, pick_list, requests):
             else:
                 continue
 
-            location = get_location(session, shelf_position)
+            shelf = shelf_position.shelf
+            ladder = shelf.ladder
+            aisle = ladder.side.aisle
 
-            aisle_priority = (
-                location["aisle"].sort_priority or location["aisle"].aisle_number
-            )
-            ladder_priority = (
-                location["ladder"].sort_priority or location["ladder"].ladder_number
-            )
-            shelf_priority = (
-                location["shelf"].sort_priority or location["shelf"].shelf_number
-            )
+            aisle_priority = aisle.sort_priority or aisle.aisle_number
+            ladder_priority = ladder.sort_priority or ladder.ladder_number
+            shelf_priority = shelf.sort_priority or shelf.shelf_number
 
             request_data.append(
                 {
@@ -260,7 +272,7 @@ def get_pick_list_detail(id: int, session: Session = Depends(get_session)):
     if not pick_list:
         raise NotFound(detail=f"Pick List ID {id} Not Found")
 
-    return sort_order_priority(session, pick_list, pick_list.requests)
+    return pick_list_detail(session, pick_list)
 
 
 @router.post("/", response_model=PickListDetailOutput, status_code=201, dependencies=[Depends(RequiresPermission("can_create_picklist_job"))])
@@ -333,7 +345,7 @@ def create_pick_list(
     )
     session.commit()
 
-    return sort_order_priority(session, new_pick_list, new_pick_list.requests)
+    return pick_list_detail(session, new_pick_list)
 
 
 @router.patch("/{id}", response_model=PickListDetailOutput, dependencies=[Depends(RequiresPermission("process_pick_lists"))])
@@ -564,9 +576,7 @@ def update_pick_list(
                     pick_list_id=id
                 )
 
-        return sort_order_priority(
-            session, existing_pick_list, existing_pick_list.requests
-        )
+        return pick_list_detail(session, existing_pick_list)
 
     except HTTPException:
         raise
@@ -655,7 +665,7 @@ def add_request_to_pick_list(
         )
     session.commit()
 
-    return sort_order_priority(session, pick_list, pick_list.requests)
+    return pick_list_detail(session, pick_list)
 
 
 @router.patch(
@@ -695,7 +705,7 @@ def update_request_for_pick_list(
     # item back to Out after completion moved it on. Checks the job too: with shipping on,
     # completing leaves requests unfulfilled until they ship.
     if request.fulfilled or existing_pick_list.status == "Completed":
-        return sort_order_priority(session, existing_pick_list, existing_pick_list.requests)
+        return pick_list_detail(session, existing_pick_list)
 
     # Paused is allowed: a scan queued offline can arrive after a colleague pauses the shared job
     if existing_pick_list.status not in ["Running", "Paused"]:
@@ -752,7 +762,7 @@ def update_request_for_pick_list(
     if request and request.batch_upload_id:
         check_batch_completion(session, request.batch_upload_id)
 
-    return sort_order_priority(session, existing_pick_list, existing_pick_list.requests)
+    return pick_list_detail(session, existing_pick_list)
 
 
 @router.delete(
@@ -860,7 +870,7 @@ def remove_request_from_pick_list(
     )
     session.commit()
 
-    return sort_order_priority(session, pick_list, pick_list.requests)
+    return pick_list_detail(session, pick_list)
 
 
 @router.delete("/{id}", dependencies=[Depends(RequiresPermission("can_delete_picklist_job"))])

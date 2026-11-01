@@ -3,16 +3,20 @@ Staff walk a pick list in the order it is returned, so they don't bounce between
 Items sort by aisle, then ladder, then shelf (sort_priority over the number when set), with
 retrieved items after the ones still to pick. Nothing here may change without a decision.
 """
+import json
 import uuid
 
 import pytest
+from sqlalchemy.orm import Session
 
 from app.models.aisles import Aisle
 from app.models.ladders import Ladder
 from app.models.modules import Module
+from app.models.pick_lists import PickList
 from app.models.requests import Request
 from app.models.side_orientations import SideOrientation
 from app.models.sides import Side
+from app.schemas.pick_lists import PickListDetailOutput
 from tests.domain.test_batch_upload_request import _requests_for, uploader, warehouse  # noqa: F401
 from tests.domain.test_move_discrepancies import (
     _make_item,
@@ -24,6 +28,7 @@ from tests.domain.test_move_discrepancies import (
 )
 from tests.domain.test_pick_list_rules import staff  # noqa: F401
 from tests.domain.test_request_list import _location
+from tests.domain.test_request_list_cost import _StatementCounter
 
 
 class Floor:
@@ -188,3 +193,47 @@ def test_item_with_no_shelf_location_goes_last(floor, staff, session):  # noqa: 
     rows = staff.get(f"/pick-lists/{pick_list_id}").json()["requests"]
 
     assert _barcodes(rows) == _values([shelved, unshelved])
+
+
+def _build_job(floor, count):
+    return floor.pick_list([
+        floor.non_tray_item(index + 1, 1, 1) if index % 3 == 0 else floor.tray_item(index + 1, 1, 1)
+        for index in range(count)
+    ])
+
+
+def _by_id(rows):
+    return {row["id"]: row for row in rows}
+
+
+def test_response_holds_the_same_data_as_loading_records_one_at_a_time(floor, staff, session):  # noqa: F811
+    pick_list_id = _build_job(floor, 6)
+
+    response = staff.get(f"/pick-lists/{pick_list_id}").json()
+
+    # A separate session with nothing loaded falls back on each model's default loading
+    with Session(session.get_bind()) as fresh:
+        pick_list = fresh.get(PickList, pick_list_id)
+        expected = json.loads(PickListDetailOutput.model_validate(pick_list, from_attributes=True).model_dump_json())
+
+    assert _by_id(response.pop("requests")) == _by_id(expected.pop("requests"))
+    assert response == expected
+
+
+@pytest.mark.parametrize("call", ["open", "start"])
+def test_cost_does_not_grow_with_the_size_of_the_job(staff, session, call):  # noqa: F811
+    def measure(pick_list_id):
+        session.expire_all()
+        with _StatementCounter(session) as counter:
+            if call == "open":
+                response = staff.get(f"/pick-lists/{pick_list_id}")
+            else:
+                response = staff.patch(f"/pick-lists/{pick_list_id}", json={"status": "Running"})
+        assert response.status_code == 200, response.text
+        return counter.count
+
+    small = measure(_build_job(Floor(staff, session), 3))
+    large = measure(_build_job(Floor(staff, session), 30))
+
+    assert large == small
+    assert small < 60
