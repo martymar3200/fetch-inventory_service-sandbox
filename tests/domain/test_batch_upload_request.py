@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.auth.dependencies import get_current_user_with_permissions
 from app.main import app as fastapi_app
+from app.models.audit_trails import AuditTrail
 from app.models.batch_upload import BatchUpload
 from app.models.delivery_locations import DeliveryLocation
 from app.models.items import Item
@@ -594,3 +595,39 @@ def test_unexpected_error_fails_the_batch_without_exposing_details(
     assert response.json()["detail"] == "The file could not be imported. Please try again or contact support."
     assert _latest_batch(session).status == "Failed"
     assert _requests_for(session, item) == []
+
+
+# --------------------------------------------------------------------------- #
+# Audit
+# --------------------------------------------------------------------------- #
+def _created_events(session, entity_type, entity_id):
+    session.expire_all()
+    return session.scalars(select(AuditTrail).where(
+        AuditTrail.event_type == "request_created",
+        AuditTrail.entity_type == entity_type,
+        AuditTrail.entity_id == str(entity_id),
+    )).all()
+
+
+def test_import_logs_a_request_created_event_per_item(client: TestClient, session, uploader, warehouse):
+    # Tray and non-tray together: the case where pandas turns the ids into floats
+    item = warehouse.tray_item()
+    non_tray = warehouse.non_tray()
+
+    assert _upload(client, uploader, _csv([
+        _row(item.barcode.value),
+        _row(non_tray.barcode.value),
+    ])).status_code == 200
+
+    batch = _latest_batch(session)
+    item_events = _created_events(session, "items", item.id)
+    assert [event.description for event in item_events] == [f"Request created from batch upload {batch.id}"]
+    assert len(_created_events(session, "non_tray_items", non_tray.id)) == 1
+
+
+def test_rejected_file_logs_no_events(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+
+    assert _upload(client, uploader, _csv([_row(item.barcode.value), _row("NOPE")])).status_code == 400
+
+    assert _created_events(session, "items", item.id) == []

@@ -60,6 +60,7 @@ from app.config.exceptions import (
 )
 
 from app.auth.dependencies import RequiresPermission
+from app.services.audit_service import log_audit_events, AuditEventType
 
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 REQUEST_FILE_REQUIRED_COLUMNS = ["Item Barcode", "External Request ID"]
@@ -582,6 +583,19 @@ def batch_upload_request(
         )
 
         session.bulk_save_objects(request_instances)
+
+        # Item ids are floats in a file mixing tray and non-tray items
+        log_audit_events(
+            session,
+            AuditEventType.REQUEST_CREATED,
+            f"Request created from batch upload {new_batch_upload.id}",
+            [
+                ("items", int(request.item_id))
+                if request.item_id
+                else ("non_tray_items", int(request.non_tray_item_id))
+                for request in request_instances
+            ],
+        )
 
         # V2 UPDATE FIX
         session.execute(

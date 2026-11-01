@@ -76,6 +76,31 @@ _EVENT_TO_OPERATION = {
 # Core Logging Function
 # ---------------------------------------------------------------------------
 
+def _resolve_audit_user(session: Session) -> tuple:
+    """
+    Who to record on an audit event: (user name, user id).
+    """
+    # Read user info from session Python attribute (set by middleware)
+    audit_info = getattr(session, "audit_info", None)
+
+    if audit_info and audit_info.get("name") and audit_info["name"] != "System":
+        user_name = audit_info["name"]
+        user_id = str(audit_info.get("id", "0"))
+    else:
+        # Fallback: read from PostgreSQL session variables set by start_session_with_audit_info
+        try:
+            from sqlalchemy import text
+            result = session.execute(text("SELECT current_setting('audit.user_name', true)")).scalar()
+            user_id_result = session.execute(text("SELECT current_setting('audit.user_id', true)")).scalar()
+            user_name = result if result else "System"
+            user_id = user_id_result if user_id_result else "0"
+        except Exception:
+            user_name = "System"
+            user_id = "0"
+
+    return user_name, user_id
+
+
 def log_audit_event(
     session: Session,
     event_type: str,
@@ -100,23 +125,7 @@ def log_audit_event(
     The event is added to the current session but **not** committed — callers
     should ensure a ``session.commit()`` happens as part of their normal flow.
     """
-    # Read user info from session Python attribute (set by middleware)
-    audit_info = getattr(session, "audit_info", None)
-
-    if audit_info and audit_info.get("name") and audit_info["name"] != "System":
-        user_name = audit_info["name"]
-        user_id = str(audit_info.get("id", "0"))
-    else:
-        # Fallback: read from PostgreSQL session variables set by start_session_with_audit_info
-        try:
-            from sqlalchemy import text
-            result = session.execute(text("SELECT current_setting('audit.user_name', true)")).scalar()
-            user_id_result = session.execute(text("SELECT current_setting('audit.user_id', true)")).scalar()
-            user_name = result if result else "System"
-            user_id = user_id_result if user_id_result else "0"
-        except Exception:
-            user_name = "System"
-            user_id = "0"
+    user_name, user_id = _resolve_audit_user(session)
 
     # Derive operation_type from event_type
     operation_type = _EVENT_TO_OPERATION.get(event_type, "UPDATE")
@@ -139,3 +148,31 @@ def log_audit_event(
     )
 
     session.add(audit_entry)
+
+
+def log_audit_events(session: Session, event_type: str, description: str, entities: list) -> None:
+    """
+    Log one audit event per (entity_type, entity_id) in the given list, for an action
+    on many records at once. The user is looked up once, and the session inserts them
+    in batches.
+
+    As with log_audit_event, the caller's ``session.commit()`` saves them.
+    """
+    user_name, user_id = _resolve_audit_user(session)
+    updated_at = datetime.now(timezone.utc)
+    session.add_all([
+        AuditTrail(
+            event_type=event_type,
+            description=description,
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            operation_type=_EVENT_TO_OPERATION.get(event_type, "UPDATE"),
+            updated_at=updated_at,
+            updated_by=user_name,
+            updated_by_user_id=user_id,
+            # The columns are NOT NULL: passing None explicitly stores a JSON null
+            original_values=None,
+            new_values=None,
+        )
+        for entity_type, entity_id in entities
+    ])
