@@ -812,6 +812,8 @@ def validate_request_data(session, request_data: pd.DataFrame):
             barcodes_errored_indices.update(missing_indices)
             errored_indices.update(missing_indices)
 
+    errored_indices.update(_validate_value_lengths(request_data, errors))
+
     # Replace empty strings with NaN and drop NaN values
     priority_values = set(request_data["Priority"].replace("", pd.NA).dropna().tolist())
     request_type_values = set(
@@ -1028,6 +1030,25 @@ def _validate_items(
             )
             errored_indices.add(row_index)
 
+    return errored_indices
+
+
+def _validate_value_lengths(request_data, errors):
+    errored_indices = set()
+    for field_name, column in (
+        ("Requestor Name", Request.requestor_name),
+        ("External Request ID", Request.external_request_id),
+    ):
+        limit = column.type.length
+        for index in request_data[request_data[field_name].str.len() > limit].index:
+            errors.append(
+                {
+                    "line": int(index) + 2,
+                    "barcode_value": request_data.at[index, "Item Barcode"],
+                    "error": f"{field_name} is longer than {limit} characters",
+                }
+            )
+            errored_indices.add(index)
     return errored_indices
 
 
@@ -1262,9 +1283,8 @@ def process_request_data(session, request_df: pd.DataFrame, batch_upload_id, req
                 if not pd.isnull(row["External Request ID"])
                 else None
             ),
-            "requestor_name": (
-                row["Requestor Name"] if not pd.isnull(row["Requestor Name"]) else None
-            ),
+            # A blank cell is saved as null, as on a manual request
+            "requestor_name": row["Requestor Name"] or None,
             "batch_upload_id": batch_upload_id,
             "building_id": (
                 item_building_ids.get(row["item_id"])

@@ -446,3 +446,151 @@ def test_deleting_a_batch_returns_its_active_items_to_in(client: TestClient, ses
     session.refresh(non_tray)
     assert item.status == "In"
     assert non_tray.status == "In"
+
+
+# --------------------------------------------------------------------------- #
+# Bad files get a clear message and leave no batch behind
+# --------------------------------------------------------------------------- #
+HEADER = ",".join(COLUMNS) + "\n"
+
+
+@pytest.mark.parametrize(
+    "body,name,content_type,message",
+    [
+        (b"hello", "notes.txt", "text/plain", "Unsupported file type"),
+        (b"", "empty.csv", "text/csv", "The file is empty"),
+        (b"not really a spreadsheet", "broken.xlsx", XLSX, "could not be read"),
+        (b"External Request ID\nE1\n", "no_barcode.csv", "text/csv", "Item Barcode"),
+        (b"Item Barcode\nB1\n", "no_external_id.csv", "text/csv", "External Request ID"),
+        (HEADER.encode(), "headers_only.csv", "text/csv", "no requests to import"),
+        ((HEADER + ",,,,,\n").encode(), "blank_template.csv", "text/csv", "no requests to import"),
+    ],
+)
+def test_bad_file_gets_a_clear_message_and_no_batch(
+    client: TestClient, session, uploader, body, name, content_type, message
+):
+    before = session.query(BatchUpload).count()
+
+    response = _upload(client, uploader, body, name=name, content_type=content_type)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    session.expire_all()
+    assert session.query(BatchUpload).count() == before
+
+
+def test_file_over_the_row_limit_is_rejected(client: TestClient, session, uploader, monkeypatch):
+    monkeypatch.setattr("app.routers.batch_upload.MAX_REQUEST_FILE_ROWS", 2)
+
+    response = _upload(client, uploader, _csv([_row(f"B{number}") for number in range(3)]))
+
+    assert response.status_code == 400
+    assert "2" in response.json()["detail"] and "3" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# What staff's files really look like
+# --------------------------------------------------------------------------- #
+def test_excel_plain_csv_keeps_accented_names(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = (HEADER + f"{item.barcode.value},E1,José,,,\n").encode("cp1252")
+
+    response = _upload(client, uploader, body)
+
+    assert response.status_code == 200, response.text
+    assert _requests_for(session, item)[0].requestor_name == "José"
+
+
+def test_excel_utf8_csv_is_accepted(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = ("﻿" + HEADER + f"{item.barcode.value},E1,José,,,\n").encode("utf-8")
+
+    response = _upload(client, uploader, body)
+
+    assert response.status_code == 200, response.text
+    assert _requests_for(session, item)[0].requestor_name == "José"
+
+
+def test_missing_optional_columns_count_as_blank(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = f"Item Barcode,External Request ID\n{item.barcode.value},E1\n".encode()
+
+    response = _upload(client, uploader, body)
+
+    assert response.status_code == 200, response.text
+    assert _requests_for(session, item)[0].priority_id is None
+
+
+def test_spaces_around_values_and_headers_are_trimmed(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = f" Item Barcode , External Request ID \n {item.barcode.value} ,  E1  \n".encode()
+
+    response = _upload(client, uploader, body)
+
+    assert response.status_code == 200, response.text
+    assert _requests_for(session, item)[0].external_request_id == "E1"
+
+
+def test_blank_requestor_name_is_saved_as_null(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+
+    assert _upload(client, uploader, _csv([_row(item.barcode.value)])).status_code == 200
+
+    assert _requests_for(session, item)[0].requestor_name is None
+
+
+def test_a_name_like_na_stays_a_name(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = (HEADER + f"{item.barcode.value},E1,NA,,,\n").encode()
+
+    assert _upload(client, uploader, body).status_code == 200
+
+    assert _requests_for(session, item)[0].requestor_name == "NA"
+
+
+def test_error_report_line_numbers_count_blank_lines(client: TestClient, session, uploader, warehouse):
+    item = warehouse.tray_item()
+    body = (HEADER + f"\n{item.barcode.value},E1,,,,\n\nNOT-A-BARCODE,E2,,,,\n").encode()
+
+    response = _upload(client, uploader, body)
+
+    assert response.status_code == 400
+    assert "\n5,NOT-A-BARCODE," in response.text.replace("\r\n", "\n")
+
+
+@pytest.mark.parametrize(
+    "row_fields,message",
+    [
+        ({"name": "N" * 51}, "Requestor Name is longer than 50 characters"),
+        ({"external_id": "E" * 256}, "External Request ID is longer than 255 characters"),
+    ],
+)
+def test_values_too_long_are_row_errors(client, session, uploader, warehouse, row_fields, message):
+    item = warehouse.tray_item()
+
+    response = _upload(client, uploader, _csv([_row(item.barcode.value, **row_fields)]))
+
+    assert response.status_code == 400
+    assert message in response.text
+
+
+# --------------------------------------------------------------------------- #
+# Unexpected failures
+# --------------------------------------------------------------------------- #
+def test_unexpected_error_fails_the_batch_without_exposing_details(
+    client: TestClient, session, uploader, warehouse, monkeypatch
+):
+    def fail(*_args):
+        raise RuntimeError("INSERT INTO requests secret-value")
+
+    monkeypatch.setattr("app.routers.batch_upload.process_request_data", fail)
+    item = warehouse.tray_item()
+
+    response = _upload(client, uploader, _csv([_row(item.barcode.value)]))
+
+    assert response.status_code == 500
+    assert "secret-value" not in response.text
+    assert "INSERT" not in response.text
+    assert response.json()["detail"] == "The file could not be imported. Please try again or contact support."
+    assert _latest_batch(session).status == "Failed"
+    assert _requests_for(session, item) == []
