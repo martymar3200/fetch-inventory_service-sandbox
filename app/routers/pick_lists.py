@@ -1,6 +1,6 @@
 # /code/app/routers/pick_lists.py - FINAL FIX FOR KEYWORD ARGUMENTS
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Response
 from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import paginate
 from sqlalchemy.orm import Session, selectinload 
@@ -840,6 +840,4 @@ def delete_pick_list(id: int, session: Session = Depends(get_session)):
     session.delete(pick_list)
     session.commit()
 
-    raise HTTPException(
-        status_code=204, detail=f"Pick list ID {id} Deleted Successfully"
-    )
+    return Response(status_code=204)

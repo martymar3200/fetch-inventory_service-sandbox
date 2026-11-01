@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Response
 from fastapi_pagination import Page
 # CRITICAL FIX: Changed from .ext.sqlmodel to .ext.sqlalchemy
 from fastapi_pagination.ext.sqlalchemy import paginate
@@ -584,8 +584,6 @@ def delete_request(id: int, session: Session = Depends(get_session)):
         )
         session.commit()
 
-        raise HTTPException(
-            status_code=204, detail=f"Request ID {id} Deleted Successfully"
-        )
+        return Response(status_code=204)
 
     raise NotFound(detail=f"Request ID {id} Not Found")
