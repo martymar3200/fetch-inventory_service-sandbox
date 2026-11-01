@@ -672,6 +672,20 @@ def update_request_for_pick_list(
         
     validate_assignment_lock(existing_pick_list, current_user.id)
 
+    request = session.get(Request, request_id)
+
+    # A repeated or replayed scan changes nothing. Setting the status again would pull an
+    # item back to Out after completion moved it on. Checks the job too: with shipping on,
+    # completing leaves requests unfulfilled until they ship.
+    if request.fulfilled or existing_pick_list.status == "Completed":
+        return sort_order_priority(session, existing_pick_list, existing_pick_list.requests)
+
+    # Paused is allowed: a scan queued offline can arrive after a colleague pauses the shared job
+    if existing_pick_list.status not in ["Running", "Paused"]:
+        raise BadRequest(
+            detail=f"Can not retrieve items on a '{PickListStatus(existing_pick_list.status).value}' Pick List"
+        )
+
     existing_pick_list.update_dt = update_dt
     
     session.execute(
@@ -681,23 +695,21 @@ def update_request_for_pick_list(
         )
     )
 
-    if pick_list_request_input.status:
-        request = session.get(Request, request_id)
-        if request.item:
-            session.execute(
-                update(Item).where(Item.id == request.item.id).values(
-                    status=pick_list_request_input.status,
-                    update_dt=datetime.now(timezone.utc)
-                )
+    if request.item:
+        session.execute(
+            update(Item).where(Item.id == request.item.id).values(
+                status=ItemStatus.Out,
+                update_dt=datetime.now(timezone.utc)
             )
+        )
 
-        else:
-            session.execute(
-                update(NonTrayItem).where(NonTrayItem.id == request.non_tray_item.id).values(
-                    status=pick_list_request_input.status,
-                    update_dt=datetime.now(timezone.utc)
-                )
+    else:
+        session.execute(
+            update(NonTrayItem).where(NonTrayItem.id == request.non_tray_item.id).values(
+                status=NonTrayItemStatus.Out,
+                update_dt=datetime.now(timezone.utc)
             )
+        )
 
     session.commit()
     session.refresh(existing_pick_list)

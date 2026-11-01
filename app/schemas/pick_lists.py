@@ -63,6 +63,14 @@ class PickListUpdateRequestInput(BaseModel):
     run_timestamp: Optional[datetime] = None
     status: Optional[str] = None
 
+    @field_validator("status", mode="before", check_fields=True)
+    @classmethod
+    def validate_status(cls, value):
+        # A scan only ever takes an item off the shelf
+        if value is not None and value != "Out":
+            raise ValueError(f"Invalid status: {value}. A scanned item can only be set to Out")
+        return value
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {

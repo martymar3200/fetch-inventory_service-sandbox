@@ -204,3 +204,97 @@ def test_repeated_complete_changes_nothing(staff, session, warehouse, monkeypatc
     assert response.json()["status"] == "Completed"
     assert _retrieval_events(session, pick_list_id) == 1
     assert check_in.call_count == 1
+
+
+def test_scan_retrieves_the_item(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+
+    response = _scan(staff, pick_list_id, request_ids[0])
+
+    assert response.status_code == 200
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).fulfilled is True
+    assert _status(session, items[0]) == ItemStatus.Out
+
+
+def test_scan_of_non_tray_item(staff, session, warehouse):
+    item = warehouse.non_tray()
+    request_id = _new_request(staff, session, item, uuid.uuid4().hex[:10])
+    pick_list_id = staff.post("/pick-lists/", json={"request_ids": [request_id]}).json()["id"]
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+
+    assert _scan(staff, pick_list_id, request_id).status_code == 200
+    assert _status(session, item) == NonTrayItemStatus.Out
+
+
+def test_scan_without_status_retrieves_the_item(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+
+    response = staff.patch(f"/pick-lists/{pick_list_id}/update_request/{request_ids[0]}", json={})
+
+    assert response.status_code == 200
+    assert _status(session, items[0]) == ItemStatus.Out
+
+
+@pytest.mark.parametrize("status", ["In", "Withdrawn", "Banana"])
+def test_scan_rejects_other_statuses(staff, session, warehouse, status):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+
+    response = staff.patch(
+        f"/pick-lists/{pick_list_id}/update_request/{request_ids[0]}", json={"status": status}
+    )
+
+    assert response.status_code == 422
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).fulfilled is False
+    assert _status(session, items[0]) == ItemStatus.PickList
+
+
+@pytest.mark.parametrize("path", [[], ["Assigned"]])
+def test_scan_rejected_before_the_job_starts(staff, session, warehouse, path):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    for status in path:
+        assert _set_status(staff, pick_list_id, status).status_code == 200
+
+    response = _scan(staff, pick_list_id, request_ids[0])
+
+    assert response.status_code == 400
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).fulfilled is False
+    assert _status(session, items[0]) == ItemStatus.PickList
+
+
+def test_scan_accepted_while_paused(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert _set_status(staff, pick_list_id, "Paused").status_code == 200
+
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+    assert _status(session, items[0]) == ItemStatus.Out
+
+
+def test_late_scan_does_not_undo_retrieved(staff, session, warehouse, monkeypatch):
+    monkeypatch.setattr("app.routers.pick_lists.get_setting_value", lambda *args, **kwargs: "true")
+    pick_list_id, request_ids, items = _completed_pick_list(staff, session, warehouse)
+    assert _status(session, items[0]) == ItemStatus.Retrieved
+
+    response = _scan(staff, pick_list_id, request_ids[0])
+
+    assert response.status_code == 200
+    assert _status(session, items[0]) == ItemStatus.Retrieved
+
+
+def test_repeated_scan_changes_nothing(staff, session, warehouse):
+    pick_list_id, request_ids, _ = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+    session.expire_all()
+    first_update = session.get(Request, request_ids[0]).update_dt
+
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).update_dt == first_update
