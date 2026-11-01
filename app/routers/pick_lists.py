@@ -279,6 +279,9 @@ def get_pick_list_list(
             sorter = PickListSorter(PickList)
             query = sorter.apply_sorting(query, sort_params)
 
+        # Without a tie break, rows can repeat or go missing between pages
+        query = query.order_by(PickList.id)
+
         return paginate(session, query)
 
     except IntegrityError as e:

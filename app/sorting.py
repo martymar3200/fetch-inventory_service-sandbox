@@ -355,25 +355,19 @@ class PickListSorter(BaseSorter):
         """
 
         if sort_params.sort_by == "request_count":
-            # Subquery to get the earliest request create_dt per PickList
-            request_sort_subquery = (
-                select(
-                    Request.pick_list_id,
-                    func.min(Request.create_dt).label("first_request_date"),
-                )
-                .group_by(Request.pick_list_id)
-                .alias("request_sort_map")
-            )
-
-            # Join PickList with the request sorting subquery
-            query = query.outerjoin(
-                request_sort_subquery,
-                PickList.id == request_sort_subquery.c.pick_list_id,
-            ).order_by(order_func(request_sort_subquery.c.first_request_date))
-
-            return query
+            return query.order_by(order_func(PickList.request_count))
+        # Outer joins and nulls last: a job with no building or assigned user still lists
         if sort_params.sort_by == "building_name":
-            return query.join(Building).order_by(order_func(Building.name))
+            return query.outerjoin(
+                Building, PickList.building_id == Building.id
+            ).order_by(nulls_last(order_func(Building.name)))
+        if sort_params.sort_by == "assigned_user_id":
+            return query.outerjoin(
+                User, PickList.assigned_user_id == User.id
+            ).order_by(
+                nulls_last(order_func(User.first_name)),
+                nulls_last(order_func(User.last_name)),
+            )
 
         # Fall back to base sorting if no custom sort logic applies
         return super().custom_sort(query, sort_params, order_func)
