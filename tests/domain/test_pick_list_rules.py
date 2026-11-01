@@ -499,3 +499,18 @@ def test_delete_returns_unscanned_items_to_the_queue(staff, session, warehouse):
     assert session.get(PickList, pick_list_id) is None
     assert session.get(Request, request_ids[0]).pick_list_id is None
     assert _status(session, items[0]) == ItemStatus.Requested
+
+
+def test_failed_update_does_not_send_internal_errors_to_the_client(staff, session, warehouse, monkeypatch):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("internal database detail")
+
+    monkeypatch.setattr("app.routers.pick_lists.auto_assign_on_start", fail)
+
+    response = _set_status(staff, pick_list_id, "Running")
+
+    assert response.status_code == 500
+    assert "internal database detail" not in response.text
+    assert "Could not update the pick list" in response.json()["detail"]

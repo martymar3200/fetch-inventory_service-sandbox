@@ -31,6 +31,7 @@ from app.schemas.pick_lists import (
     PickListDetailOutput,
     PickListUpdateRequestInput,
 )
+from app.logger import inventory_logger
 from app.config.exceptions import (
     BadRequest,
     NotFound,
@@ -570,7 +571,9 @@ def update_pick_list(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        session.rollback()
+        inventory_logger.error(f"Pick List {id} update failed: {e}")
+        raise InternalServerError(detail="Could not update the pick list. Please try again.")
 
 
 @router.patch("/{pick_list_id}/add_request", response_model=PickListDetailOutput, dependencies=[Depends(RequiresPermission("process_pick_lists"))])
