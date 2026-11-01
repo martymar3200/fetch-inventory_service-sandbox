@@ -870,7 +870,16 @@ def delete_pick_list(id: int, session: Session = Depends(get_session)):
     if not pick_list:
         raise NotFound(detail=f"Pick List ID {id} Not Found")
 
+    if pick_list.status == "Completed":
+        raise BadRequest(detail="Pick List Already Completed")
+
     requests = pick_list.requests
+
+    # Deleting sends every item back to the queue, but these are already off the shelf
+    if any(request.fulfilled for request in requests):
+        raise BadRequest(
+            detail=f"Pick List {id} can not be deleted: items have already been retrieved"
+        )
 
     item_ids = [request.item_id for request in requests if request.item_id is not None]
     non_tray_item_ids = [request.non_tray_item_id for request in requests if request.non_tray_item_id is not None]

@@ -462,3 +462,40 @@ def test_remove_returns_an_unscanned_item_to_the_queue(staff, session, warehouse
     session.expire_all()
     assert session.get(Request, request_ids[0]).pick_list_id is None
     assert _status(session, items[0]) == ItemStatus.Requested
+
+
+def test_delete_rejected_when_completed(staff, session, warehouse):
+    pick_list_id, request_ids, items = _completed_pick_list(staff, session, warehouse)
+
+    response = staff.delete(f"/pick-lists/{pick_list_id}")
+
+    assert response.status_code == 400
+    session.expire_all()
+    assert session.get(PickList, pick_list_id) is not None
+    assert session.get(Request, request_ids[0]).pick_list_id == pick_list_id
+    assert _status(session, items[0]) == ItemStatus.Out
+
+
+def test_delete_rejected_once_an_item_is_scanned(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse, count=2)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+
+    response = staff.delete(f"/pick-lists/{pick_list_id}")
+
+    assert response.status_code == 400
+    assert "already been retrieved" in response.json()["detail"]
+    assert _status(session, items[0]) == ItemStatus.Out
+    assert _status(session, items[1]) == ItemStatus.PickList
+
+
+def test_delete_returns_unscanned_items_to_the_queue(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+
+    assert staff.delete(f"/pick-lists/{pick_list_id}").status_code == 204
+
+    session.expire_all()
+    assert session.get(PickList, pick_list_id) is None
+    assert session.get(Request, request_ids[0]).pick_list_id is None
+    assert _status(session, items[0]) == ItemStatus.Requested
