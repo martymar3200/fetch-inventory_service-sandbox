@@ -46,7 +46,13 @@ from app.config.exceptions import (
     InternalServerError,
 )
 from app.sorting import RequestSorter
-from app.utilities import get_module_shelf_position, check_batch_completion
+from app.utilities import (
+    blocked_delivery_location_message,
+    check_batch_completion,
+    get_module_shelf_position,
+    get_owner_allowed_delivery_locations,
+    is_delivery_location_allowed,
+)
 
 from app.auth.dependencies import RequiresPermission, get_current_user_with_permissions
 from app.services.audit_service import log_audit_event, AuditEventType
@@ -436,27 +442,16 @@ def create_request(
         
         if owner_id:
             # Import here to avoid circular imports
-            from app.models.owner_delivery_locations import OwnerDeliveryLocation
             from app.models.owners import Owner
-            
-            # Check if owner has any delivery location restrictions
-            owner_locations = session.execute(
-                select(OwnerDeliveryLocation).where(
-                    OwnerDeliveryLocation.owner_id == owner_id
-                )
-            ).scalars().all()
-            
-            # If owner has delivery location restrictions, validate
-            if owner_locations:
-                allowed_location_ids = [ol.delivery_location_id for ol in owner_locations]
-                if request_input.delivery_location_id not in allowed_location_ids:
-                    # Get owner name for error message
-                    owner = session.get(Owner, owner_id)
-                    owner_name = owner.name if owner else f"ID {owner_id}"
-                    raise BadRequest(
-                        detail=f"Delivery location is not allowed for items owned by '{owner_name}'. "
-                               f"Please select an allowed delivery location for this owner."
-                    )
+
+            allowed_by_owner = get_owner_allowed_delivery_locations(session, [owner_id])
+            if not is_delivery_location_allowed(
+                allowed_by_owner, owner_id, request_input.delivery_location_id
+            ):
+                # Get owner name for error message
+                owner = session.get(Owner, owner_id)
+                owner_name = owner.name if owner else f"ID {owner_id}"
+                raise BadRequest(detail=blocked_delivery_location_message(owner_name))
 
     new_request = Request(**request_input.model_dump(exclude={"barcode_value"}))
 

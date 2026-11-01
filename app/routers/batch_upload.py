@@ -199,6 +199,11 @@ async def delete_batch_upload(id: int, session: Session = Depends(get_session)):
     from app.models.non_tray_items import NonTrayItem
     
     for request in batch_requests:
+        # A deleted request already gave its item back, and the item may be on a newer request
+        if request.deleted:
+            session.delete(request)
+            continue
+
         # Handle tray items
         if request.item_id:
             item = session.get(Item, request.item_id)

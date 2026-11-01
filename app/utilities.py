@@ -553,45 +553,54 @@ def get_refile_queue(params):
     return session.scalars(select(model).where(column.in_(values))).all()
 
 
-def _fetch_building_id_from_item(session, item_id, item_type):
-    if item_type == "Item":
-        item = session.get(Item, item_id)
-        if item and item.tray:
-            tray = item.tray
-            if tray.shelf_position_id and tray.shelf_position:
-                shelf_position = tray.shelf_position
-                if shelf_position.shelf_id and shelf_position.shelf:
-                    shelf = shelf_position.shelf
-                    if shelf.ladder_id and shelf.ladder:
-                        ladder = shelf.ladder
-                        if ladder.side_id and ladder.side:
-                            side = ladder.side
-                            if side.aisle_id and side.aisle:
-                                aisle = side.aisle
-                                if aisle.module_id and aisle.module:
-                                    module = aisle.module
-                                    if module.building_id:
-                                        return module.building_id
-    else:
-        non_tray_item = session.get(NonTrayItem, item_id)
-        if (
-            non_tray_item
-            and non_tray_item.shelf_position_id
-            and non_tray_item.shelf_position
-        ):
-            shelf_position = non_tray_item.shelf_position
-            if shelf_position.shelf_id and shelf_position.shelf:
-                shelf = shelf_position.shelf
-                if shelf.ladder_id and shelf.ladder:
-                    ladder = shelf.ladder
-                    if ladder.side_id and ladder.side:
-                        side = ladder.side
-                        if side.aisle_id and side.aisle:
-                            aisle = side.aisle
-                            if aisle.module_id and aisle.module:
-                                module = aisle.module
-                                if module.building_id:
-                                    return module.building_id
+def _fetch_existing_data(session, model, values, column):
+    return session.scalars(select(model).where(column.in_(values))).all()
+
+
+def _building_ids_by_id(session, model, shelf_position_id_column, ids, *joins):
+    """
+    Maps each given Item or NonTrayItem id to the building of its shelf location.
+    """
+    query = select(model.id, Module.building_id).select_from(model)
+    for target, on_clause in joins:
+        query = query.join(target, on_clause)
+    query = (
+        query.join(ShelfPosition, shelf_position_id_column == ShelfPosition.id)
+        .join(Shelf, ShelfPosition.shelf_id == Shelf.id)
+        .join(Ladder, Shelf.ladder_id == Ladder.id)
+        .join(Side, Ladder.side_id == Side.id)
+        .join(Aisle, Side.aisle_id == Aisle.id)
+        .join(Module, Aisle.module_id == Module.id)
+        .where(model.id.in_(ids))
+    )
+    return dict(session.execute(query).all())
+
+
+def get_owner_allowed_delivery_locations(session, owner_ids):
+    """
+    Maps each owner with delivery location limits to its allowed location ids.
+    Owners with no limits aren't in the result.
+    """
+    rows = session.execute(
+        select(OwnerDeliveryLocation.owner_id, OwnerDeliveryLocation.delivery_location_id)
+        .where(OwnerDeliveryLocation.owner_id.in_(owner_ids))
+    ).all()
+    allowed_by_owner = {}
+    for owner_id, delivery_location_id in rows:
+        allowed_by_owner.setdefault(owner_id, set()).add(delivery_location_id)
+    return allowed_by_owner
+
+
+def is_delivery_location_allowed(allowed_by_owner, owner_id, delivery_location_id):
+    allowed = allowed_by_owner.get(owner_id)
+    return not allowed or delivery_location_id in allowed
+
+
+def blocked_delivery_location_message(owner_name):
+    return (
+        f"Delivery location is not allowed for items owned by '{owner_name}'. "
+        f"Please select an allowed delivery location for this owner."
+    )
 
 
 def _map_values_to_ids(data, key_column, value_column):
@@ -916,6 +925,7 @@ def validate_request_data(session, request_data: pd.DataFrame):
             )
         )
         .where(Request.fulfilled == False)
+        .where(Request.deleted == False)
     ).all()
     
     # Create sets of "requested" IDs for O(1) lookup
@@ -931,6 +941,11 @@ def validate_request_data(session, request_data: pd.DataFrame):
             requested_item_ids, 
             requested_non_tray_ids, 
             errors
+        )
+    )
+    errored_indices.update(
+        _validate_delivery_location_limits(
+            session, request_data, barcode_dict, item_map, non_tray_item_map, errors
         )
     )
     errored_indices.update(barcodes_errored_indices)
@@ -1014,6 +1029,54 @@ def _validate_items(
             errored_indices.add(row_index)
 
     return errored_indices
+
+
+def _validate_delivery_location_limits(
+    session, request_data, barcode_dict, item_map, non_tray_item_map, errors
+):
+    """
+    Applies the same owner delivery location limits as a manual request.
+    """
+    rows = []
+    for index, row in request_data.iterrows():
+        barcode_id = barcode_dict.get(row["Item Barcode"])
+        item = item_map.get(barcode_id) or non_tray_item_map.get(barcode_id)
+        if item and row["Delivery Location"]:
+            rows.append((index, row, item.owner_id))
+    if not rows:
+        return set()
+
+    delivery_location_ids = dict(session.execute(
+        select(DeliveryLocation.name, DeliveryLocation.id)
+        .where(DeliveryLocation.name.in_({row["Delivery Location"] for _, row, _ in rows}))
+    ).all())
+    allowed_by_owner = get_owner_allowed_delivery_locations(
+        session, {owner_id for _, _, owner_id in rows}
+    )
+    blocked_rows = [
+        (index, row, owner_id)
+        for index, row, owner_id in rows
+        # An unknown location name is reported by its own check
+        if row["Delivery Location"] in delivery_location_ids
+        and not is_delivery_location_allowed(
+            allowed_by_owner, owner_id, delivery_location_ids[row["Delivery Location"]]
+        )
+    ]
+    if not blocked_rows:
+        return set()
+
+    owner_names = dict(session.execute(
+        select(Owner.id, Owner.name).where(Owner.id.in_({owner_id for _, _, owner_id in blocked_rows}))
+    ).all())
+    for index, row, owner_id in blocked_rows:
+        errors.append(
+            {
+                "line": int(index) + 2,
+                "barcode_value": row["Item Barcode"],
+                "error": blocked_delivery_location_message(owner_names.get(owner_id)),
+            }
+        )
+    return {index for index, _, _ in blocked_rows}
 
 
 def _validate_item(
@@ -1101,7 +1164,6 @@ def _validate_item(
 
 
 def process_request_data(session, request_df: pd.DataFrame, batch_upload_id, requested_by_id):
-    building_id = None
     barcodes = request_df["Item Barcode"].tolist()
     barcode_objs = _fetch_existing_data(session, Barcode, barcodes, Barcode.value)
     barcode_dict = {b.value: str(b.id) for b in barcode_objs}
@@ -1157,18 +1219,20 @@ def process_request_data(session, request_df: pd.DataFrame, batch_upload_id, req
         columns=["Priority", "Request Type", "Delivery Location", "Item Barcode"]
     )
 
-    if building_id is None:
-        for index, row in request_df.iterrows():
-            if not pd.isnull(row["item_id"]):
-                building_id = _fetch_building_id_from_item(
-                    session, row["item_id"], "Item"
-                )
-                break
-            if not pd.isnull(row["non_tray_item_id"]):
-                building_id = _fetch_building_id_from_item(
-                    session, row["non_tray_item_id"], "Non Tray Item"
-                )
-                break
+    # Each request gets the building of its own item
+    item_building_ids = _building_ids_by_id(
+        session,
+        Item,
+        Tray.shelf_position_id,
+        [item.id for item in items],
+        (Tray, Item.tray_id == Tray.id),
+    )
+    non_tray_item_building_ids = _building_ids_by_id(
+        session,
+        NonTrayItem,
+        NonTrayItem.shelf_position_id,
+        [item.id for item in non_tray_items],
+    )
 
     # Create Request instances from the DataFrame
     request_instances = []
@@ -1202,9 +1266,12 @@ def process_request_data(session, request_df: pd.DataFrame, batch_upload_id, req
                 row["Requestor Name"] if not pd.isnull(row["Requestor Name"]) else None
             ),
             "batch_upload_id": batch_upload_id,
+            "building_id": (
+                item_building_ids.get(row["item_id"])
+                if not pd.isnull(row["item_id"])
+                else non_tray_item_building_ids.get(row["non_tray_item_id"])
+            ),
         }
-        if building_id is not None:
-            request_data["building_id"] = building_id
         if requested_by_id:
             request_data["requested_by_id"] = requested_by_id
 
