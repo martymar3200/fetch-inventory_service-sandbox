@@ -30,6 +30,7 @@ from app.schemas.pick_lists import (
     PickListListOutput,
     PickListDetailOutput,
     PickListUpdateRequestInput,
+    PickListScanOutput,
 )
 from app.logger import inventory_logger
 from app.config.exceptions import (
@@ -132,6 +133,28 @@ def pick_list_detail(session: Session, pick_list):
     ).scalars().all()
 
     return sort_order_priority(pick_list, requests)
+
+
+def pick_list_scan_result(session: Session, pick_list):
+    rows = session.execute(
+        select(Request.id, Request.fulfilled, Item.status, NonTrayItem.status)
+        .outerjoin(Item, Request.item_id == Item.id)
+        .outerjoin(NonTrayItem, Request.non_tray_item_id == NonTrayItem.id)
+        .where(Request.pick_list_id == pick_list.id)
+    ).all()
+
+    return {
+        "id": pick_list.id,
+        "status": pick_list.status,
+        "requests": [
+            {
+                "id": request_id,
+                "fulfilled": fulfilled,
+                "item_status": item_status or non_tray_item_status,
+            }
+            for request_id, fulfilled, item_status, non_tray_item_status in rows
+        ],
+    }
 
 
 def sort_order_priority(pick_list, requests):
@@ -669,7 +692,7 @@ def add_request_to_pick_list(
 
 
 @router.patch(
-    "/{pick_list_id}/update_request/{request_id}", response_model=PickListDetailOutput, dependencies=[Depends(RequiresPermission("process_pick_lists"))]
+    "/{pick_list_id}/update_request/{request_id}", response_model=PickListScanOutput, dependencies=[Depends(RequiresPermission("process_pick_lists"))]
 )
 def update_request_for_pick_list(
     pick_list_id: int,
@@ -705,7 +728,7 @@ def update_request_for_pick_list(
     # item back to Out after completion moved it on. Checks the job too: with shipping on,
     # completing leaves requests unfulfilled until they ship.
     if request.fulfilled or existing_pick_list.status == "Completed":
-        return pick_list_detail(session, existing_pick_list)
+        return pick_list_scan_result(session, existing_pick_list)
 
     # Paused is allowed: a scan queued offline can arrive after a colleague pauses the shared job
     if existing_pick_list.status not in ["Running", "Paused"]:
@@ -762,7 +785,7 @@ def update_request_for_pick_list(
     if request and request.batch_upload_id:
         check_batch_completion(session, request.batch_upload_id)
 
-    return pick_list_detail(session, existing_pick_list)
+    return pick_list_scan_result(session, existing_pick_list)
 
 
 @router.delete(

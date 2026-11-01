@@ -237,3 +237,67 @@ def test_cost_does_not_grow_with_the_size_of_the_job(staff, session, call):  # n
 
     assert large == small
     assert small < 60
+
+
+def _start_and_rows(staff, pick_list_id):  # noqa: F811
+    assert staff.patch(f"/pick-lists/{pick_list_id}", json={"status": "Running"}).status_code == 200
+    return staff.get(f"/pick-lists/{pick_list_id}").json()["requests"]
+
+
+def _scan(staff, pick_list_id, request_id):  # noqa: F811
+    response = staff.patch(f"/pick-lists/{pick_list_id}/update_request/{request_id}", json={"status": "Out"})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_scan_response_reports_every_request_including_a_colleagues_scan(floor, staff):  # noqa: F811
+    pick_list_id = _build_job(floor, 3)
+    rows = _start_and_rows(staff, pick_list_id)
+
+    _scan(staff, pick_list_id, rows[0]["id"])  # a colleague's scan
+    result = _scan(staff, pick_list_id, rows[1]["id"])
+
+    assert result["id"] == pick_list_id
+    assert result["status"] == "Running"
+    assert {row["id"]: (row["fulfilled"], row["item_status"]) for row in result["requests"]} == {
+        rows[0]["id"]: (True, "Out"),
+        rows[1]["id"]: (True, "Out"),
+        rows[2]["id"]: (False, "PickList"),
+    }
+
+
+def test_scan_response_shows_a_colleague_pausing_the_job(floor, staff):  # noqa: F811
+    pick_list_id = _build_job(floor, 2)
+    rows = _start_and_rows(staff, pick_list_id)
+    assert staff.patch(f"/pick-lists/{pick_list_id}", json={"status": "Paused"}).status_code == 200
+
+    assert _scan(staff, pick_list_id, rows[0]["id"])["status"] == "Paused"
+
+
+def test_repeated_scan_returns_the_same_compact_result(floor, staff):  # noqa: F811
+    pick_list_id = _build_job(floor, 2)
+    rows = _start_and_rows(staff, pick_list_id)
+    first = _scan(staff, pick_list_id, rows[0]["id"])
+
+    second = _scan(staff, pick_list_id, rows[0]["id"])
+
+    assert _by_id(second["requests"]) == _by_id(first["requests"])
+
+
+def test_scan_response_stays_small_and_cheap_on_a_large_job(staff, session):  # noqa: F811
+    def measure(count):
+        pick_list_id = _build_job(Floor(staff, session), count)
+        rows = _start_and_rows(staff, pick_list_id)
+        session.expire_all()
+        with _StatementCounter(session) as counter:
+            response = staff.patch(
+                f"/pick-lists/{pick_list_id}/update_request/{rows[0]['id']}", json={"status": "Out"}
+            )
+        assert response.status_code == 200, response.text
+        return counter.count, len(response.content)
+
+    small_statements, _ = measure(3)
+    large_statements, large_size = measure(30)
+
+    assert large_statements == small_statements
+    assert large_size < 30 * 100

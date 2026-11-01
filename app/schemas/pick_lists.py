@@ -94,6 +94,22 @@ class PickListUpdateRequestInput(BaseModel):
     )
 
 
+class PickListScanRequestOutput(BaseModel):
+    id: int
+    fulfilled: Optional[bool] = None
+    item_status: Optional[str] = None
+
+
+class PickListScanOutput(BaseModel):
+    """
+    What a scan sends back: enough to show colleagues' scans on a shared job
+    without resending every item's details.
+    """
+    id: int
+    status: str
+    requests: list[PickListScanRequestOutput]
+
+
 class PickListBaseOutput(BaseModel):
     id: int
     assigned_user_id: Optional[int] = None
