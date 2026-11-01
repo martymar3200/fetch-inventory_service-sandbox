@@ -1,5 +1,5 @@
 """Unit tests for the pure validators/helpers in app/utilities.py — no database."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytz
@@ -180,7 +180,7 @@ def test_manage_transition_running_to_canceled():
     assert result.run_time == timedelta(minutes=20)
 
 
-def test_manage_transition_noop_for_unqualified_transition():
+def test_manage_transition_entering_running_adds_no_time():
     original = SimpleNamespace(
         status="Created",
         run_time=timedelta(minutes=2),
@@ -190,7 +190,7 @@ def test_manage_transition_noop_for_unqualified_transition():
     update = SimpleNamespace(status="Running", run_timestamp=datetime(2026, 1, 1, 10, 0, 0))
     result = manage_transition(original, update)
     assert result.run_time == timedelta(minutes=2)
-    assert result.last_transition is None
+    assert result.last_transition == make_aware(update.run_timestamp)
 
 
 def test_manage_transition_initializes_none_run_time_even_on_noop():
@@ -203,3 +203,48 @@ def test_manage_transition_initializes_none_run_time_even_on_noop():
     update = SimpleNamespace(status="Running", run_timestamp=datetime(2026, 1, 1, 10, 0, 0))
     result = manage_transition(original, update)
     assert result.run_time == timedelta(0)
+
+
+def test_manage_transition_starts_the_clock_on_entering_running():
+    queued = datetime(2026, 1, 1, 9, 0, 0)
+    original = SimpleNamespace(
+        status="Created", run_time=timedelta(0), last_transition=queued, create_dt=queued
+    )
+    update = SimpleNamespace(status="Running", run_timestamp=queued + timedelta(hours=3))
+    result = manage_transition(original, update)
+    assert result.run_time == timedelta(0)
+    assert result.last_transition == make_aware(update.run_timestamp)
+
+
+def test_manage_transition_repeated_status_changes_nothing():
+    base = datetime(2026, 1, 1, 10, 0, 0)
+    original = SimpleNamespace(
+        status="Running", run_time=timedelta(minutes=5), last_transition=base, create_dt=base
+    )
+    update = SimpleNamespace(status="Running", run_timestamp=base + timedelta(minutes=30))
+    result = manage_transition(original, update)
+    assert result.run_time == timedelta(minutes=5)
+    assert result.last_transition == base
+
+
+def test_manage_transition_device_clock_behind_takes_no_time_away():
+    base = datetime(2026, 1, 1, 10, 0, 0)
+    original = SimpleNamespace(
+        status="Running", run_time=timedelta(minutes=5), last_transition=base, create_dt=base
+    )
+    update = SimpleNamespace(status="Paused", run_timestamp=base - timedelta(minutes=30))
+    result = manage_transition(original, update)
+    assert result.run_time == timedelta(minutes=5)
+
+
+def test_manage_transition_without_a_timestamp_uses_server_time():
+    original = SimpleNamespace(
+        status="Created",
+        run_time=None,
+        last_transition=datetime(2026, 1, 1, 10, 0, 0),
+        create_dt=datetime(2026, 1, 1, 10, 0, 0),
+    )
+    before = datetime.now(timezone.utc)
+    result = manage_transition(original, SimpleNamespace(status="Running", run_timestamp=None))
+    assert result.run_time == timedelta(0)
+    assert result.last_transition >= before

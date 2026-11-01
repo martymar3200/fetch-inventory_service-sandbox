@@ -499,7 +499,7 @@ def update_shelving_job(
                 original_status
             )
 
-        if shelving_job.status and shelving_job.run_timestamp:
+        if shelving_job.status:
             existing_shelving_job = manage_transition(
                 existing_shelving_job, shelving_job
             )

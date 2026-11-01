@@ -535,7 +535,7 @@ def update_pick_list(
                             if getattr(non_tray_item, 'barcode', None):
                                 items_to_sync.append((non_tray_item.barcode.value, non_tray_item.owner_id, True))
 
-        if pick_list.status and pick_list.run_timestamp:
+        if pick_list.status:
             existing_pick_list = manage_transition(existing_pick_list, pick_list)
 
         mutated_data = pick_list.model_dump(

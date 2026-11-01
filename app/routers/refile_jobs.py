@@ -379,7 +379,7 @@ def update_refile_job(
             original_status
         )
 
-    if refile_job.status and refile_job.run_timestamp:
+    if refile_job.status:
         existing_refile_job = manage_transition(existing_refile_job, refile_job)
 
     mutated_data = refile_job.model_dump(exclude_unset=True, exclude={"run_timestamp"})

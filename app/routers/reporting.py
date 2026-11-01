@@ -2729,8 +2729,13 @@ def get_worker_efficiency_query(params):
             combined.c.job_type,
             func.count().label("total_jobs"),
             func.sum(combined.c['items']).label("total_items_processed"),
+            # Rebuilt from seconds: to_char drops an interval's whole days
             func.coalesce(
-                func.to_char(func.sum(combined.c.run_time), 'HH24:MI:SS'), '00:00:00'
+                func.to_char(
+                    func.make_interval(0, 0, 0, 0, 0, 0, cast(total_seconds, sa.Float)),
+                    'HH24:MI:SS',
+                ),
+                '00:00:00',
             ).label("total_active_time"),
             func.round(func.coalesce(items_per_hour, 0)).label("items_per_hour")
         )

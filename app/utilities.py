@@ -317,36 +317,31 @@ def make_aware(dt):
 
 def manage_transition(original_record, update_record):
     """
-    Task manages transition logic for running state.
-    - updates run_time
-    - tracks last_transition
+    Keeps run_time to the time a job actually spends Running.
+    - leaving Running adds the stretch that just ended to run_time
+    - every change of status starts a new stretch in last_transition
+
+    run_timestamp comes from the device, so scans made offline keep the time they
+    happened. A request without one uses the server's time.
     """
-    run_timestamp = make_aware(update_record.run_timestamp)
+    run_timestamp = (
+        make_aware(update_record.run_timestamp)
+        if update_record.run_timestamp
+        else datetime.now(timezone.utc)
+    )
 
     if original_record.run_time is None:
         original_record.run_time = timedelta(0)
 
-    should_update_run_time = False
+    if original_record.status == update_record.status:
+        return original_record
 
-    # Define transitions where run_time should be updated
-    transition_pairs = {
-        ("Running", "Paused"),
-        ("Running", "Completed"),
-        ("Running", "Canceled"),
-    }
+    if original_record.status == "Running":
+        started = make_aware(original_record.last_transition or original_record.create_dt)
+        # A device clock behind the last stretch's start must not take time away
+        original_record.run_time += max(run_timestamp - started, timedelta(0))
 
-    if (original_record.status, update_record.status) in transition_pairs:
-        should_update_run_time = True
-
-    if should_update_run_time:
-        if original_record.last_transition:
-            last_transition = make_aware(original_record.last_transition)
-            original_record.run_time += run_timestamp - last_transition
-        elif not original_record.last_transition:
-            create_dt = make_aware(original_record.create_dt)
-            original_record.run_time += run_timestamp - create_dt
-
-        original_record.last_transition = run_timestamp
+    original_record.last_transition = run_timestamp
 
     return original_record
 
