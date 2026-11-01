@@ -14,6 +14,7 @@ from app.auth.dependencies import get_current_user_with_permissions
 from app.models.item_retrieval_events import ItemRetrievalEvent
 from app.models.items import Item, ItemStatus
 from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
+from app.models.pick_lists import PickList
 from app.models.requests import Request
 from app.models.withdraw_jobs import WithdrawJob
 from tests.domain.test_batch_upload_request import _requests_for, uploader, warehouse  # noqa: F401
@@ -298,3 +299,166 @@ def test_repeated_scan_changes_nothing(staff, session, warehouse):
 
     session.expire_all()
     assert session.get(Request, request_ids[0]).update_dt == first_update
+
+
+def _pick_list_count(session):
+    session.expire_all()
+    return session.scalar(select(func.count(PickList.id)))
+
+
+def test_create_with_missing_id_saves_nothing(staff, session, warehouse):
+    item = warehouse.tray_item()
+    request_id = _new_request(staff, session, item, uuid.uuid4().hex[:10])
+    before = _pick_list_count(session)
+
+    response = staff.post("/pick-lists/", json={"request_ids": [request_id, 99999999]})
+
+    assert response.status_code == 400
+    assert "99999999" in response.json()["detail"]
+    assert _pick_list_count(session) == before
+    assert session.get(Request, request_id).pick_list_id is None
+    assert _status(session, item) == ItemStatus.Requested
+
+
+def test_create_with_no_ids_is_rejected(staff, session, warehouse):
+    assert staff.post("/pick-lists/", json={"request_ids": []}).status_code == 400
+
+
+def test_create_with_a_repeated_id_works(staff, session, warehouse):
+    item = warehouse.tray_item()
+    request_id = _new_request(staff, session, item, uuid.uuid4().hex[:10])
+
+    response = staff.post("/pick-lists/", json={"request_ids": [request_id, request_id]})
+
+    assert response.status_code == 201
+    assert response.json()["request_count"] == 1
+
+
+def test_create_can_not_take_a_request_from_another_list(staff, session, warehouse):
+    pick_list_id, request_ids, _ = _new_pick_list(staff, session, warehouse)
+
+    response = staff.post("/pick-lists/", json={"request_ids": request_ids})
+
+    assert response.status_code == 400
+    assert str(request_ids[0]) in response.json()["detail"]
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).pick_list_id == pick_list_id
+
+
+def test_add_can_not_take_a_request_from_another_list(staff, session, warehouse):
+    source_id, request_ids, _ = _new_pick_list(staff, session, warehouse)
+    target_id, _, _ = _new_pick_list(staff, session, warehouse)
+
+    response = staff.patch(f"/pick-lists/{target_id}/add_request", json={"request_ids": request_ids})
+
+    assert response.status_code == 400
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).pick_list_id == source_id
+
+
+@pytest.mark.parametrize("shipping", ["false", "true"])
+def test_finished_request_can_not_go_on_a_new_list(staff, session, warehouse, monkeypatch, shipping):
+    monkeypatch.setattr("app.routers.pick_lists.get_setting_value", lambda *args, **kwargs: shipping)
+    source_id, request_ids, items = _completed_pick_list(staff, session, warehouse)
+    status_before = _status(session, items[0])
+
+    response = staff.post("/pick-lists/", json={"request_ids": request_ids})
+
+    assert response.status_code == 400
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).pick_list_id == source_id
+    assert _status(session, items[0]) == status_before
+
+
+def test_deleted_request_can_not_go_on_a_list(staff, session, warehouse):
+    item = warehouse.tray_item()
+    request_id = _new_request(staff, session, item, uuid.uuid4().hex[:10])
+    session.get(Request, request_id).deleted = True
+    session.commit()
+
+    assert staff.post("/pick-lists/", json={"request_ids": [request_id]}).status_code == 400
+
+
+def test_create_rejects_mixed_buildings(staff, session, warehouse):
+    request_ids = [
+        _new_request(staff, session, warehouse.tray_item(warehouse.ladder_a), uuid.uuid4().hex[:10]),
+        _new_request(staff, session, warehouse.tray_item(warehouse.ladder_b), uuid.uuid4().hex[:10]),
+    ]
+    before = _pick_list_count(session)
+
+    response = staff.post("/pick-lists/", json={"request_ids": request_ids})
+
+    assert response.status_code == 400
+    assert "same building" in response.json()["detail"]
+    assert _pick_list_count(session) == before
+
+
+def test_add_rejects_a_request_from_another_building(staff, session, warehouse):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+    request_id = _new_request(staff, session, warehouse.tray_item(warehouse.ladder_b), uuid.uuid4().hex[:10])
+
+    response = staff.patch(f"/pick-lists/{pick_list_id}/add_request", json={"request_ids": [request_id]})
+
+    assert response.status_code == 400
+    assert "different building" in response.json()["detail"]
+    session.expire_all()
+    assert session.get(Request, request_id).pick_list_id is None
+
+
+def test_add_a_free_request_from_the_same_building(staff, session, warehouse):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+    item = warehouse.tray_item()
+    request_id = _new_request(staff, session, item, uuid.uuid4().hex[:10])
+
+    response = staff.patch(f"/pick-lists/{pick_list_id}/add_request", json={"request_ids": [request_id]})
+
+    assert response.status_code == 200
+    assert response.json()["request_count"] == 2
+    assert _status(session, item) == ItemStatus.PickList
+
+
+def test_add_with_only_a_missing_id_is_rejected(staff, session, warehouse):
+    pick_list_id, _, _ = _new_pick_list(staff, session, warehouse)
+
+    response = staff.patch(f"/pick-lists/{pick_list_id}/add_request", json={"request_ids": [99999999]})
+
+    assert response.status_code == 400
+    assert "99999999" in response.json()["detail"]
+
+
+def test_add_to_a_missing_pick_list_is_not_found(staff, session, warehouse):
+    assert staff.patch("/pick-lists/99999999/add_request", json={"request_ids": [1]}).status_code == 404
+
+
+def test_remove_can_not_reach_another_list(staff, session, warehouse):
+    other_id, _, _ = _new_pick_list(staff, session, warehouse)
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+
+    response = staff.delete(f"/pick-lists/{other_id}/remove_request/{request_ids[0]}")
+
+    assert response.status_code == 404
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).pick_list_id == pick_list_id
+    assert _status(session, items[0]) == ItemStatus.PickList
+
+
+def test_remove_rejected_once_scanned(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+    assert _set_status(staff, pick_list_id, "Running").status_code == 200
+    assert _scan(staff, pick_list_id, request_ids[0]).status_code == 200
+
+    response = staff.delete(f"/pick-lists/{pick_list_id}/remove_request/{request_ids[0]}")
+
+    assert response.status_code == 400
+    assert _status(session, items[0]) == ItemStatus.Out
+
+
+def test_remove_returns_an_unscanned_item_to_the_queue(staff, session, warehouse):
+    pick_list_id, request_ids, items = _new_pick_list(staff, session, warehouse)
+
+    response = staff.delete(f"/pick-lists/{pick_list_id}/remove_request/{request_ids[0]}")
+
+    assert response.status_code == 200
+    session.expire_all()
+    assert session.get(Request, request_ids[0]).pick_list_id is None
+    assert _status(session, items[0]) == ItemStatus.Requested

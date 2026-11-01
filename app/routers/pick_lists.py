@@ -87,6 +87,36 @@ def validate_status_change(session: Session, pick_list, new_status: str):
             )
 
 
+def get_requests_for_pick_list(session: Session, request_ids: list[int]):
+    """
+    Load the requests being put on a pick list. All of them must be available and in
+    one building, so a failure saves nothing and leaves nothing half done to retry.
+    """
+    requests = (
+        session.execute(select(Request).filter(Request.id.in_(request_ids)))
+        .scalars()
+        .all()
+    )
+
+    missing = sorted(set(request_ids) - {request.id for request in requests})
+    if missing:
+        raise BadRequest(detail=f"Request IDs Not Found: {', '.join(map(str, missing))}")
+
+    unavailable = sorted(
+        request.id for request in requests
+        if request.deleted or request.fulfilled or request.pick_list_id
+    )
+    if unavailable:
+        raise BadRequest(
+            detail=f"Requests already on a pick list, completed or deleted: {', '.join(map(str, unavailable))}"
+        )
+
+    if len({request.building_id for request in requests if request.building_id}) > 1:
+        raise BadRequest(detail="All requests on a pick list must be in the same building")
+
+    return requests
+
+
 def sort_order_priority(session: Session, pick_list, requests):
     request_data = []
     
@@ -239,20 +269,11 @@ def create_pick_list(
     """
     Create a new pick list.
     """
-    errored_request_ids = []
-    
+    if not pick_list_input.request_ids:
+        raise BadRequest(detail="Request IDs Not Found")
+
     # 1. Fetch Requests
-    requests = (
-        session.execute(select(Request).filter(Request.id.in_(pick_list_input.request_ids)))
-        .scalars()
-        .all()
-    )
-
-    if not requests:
-        raise BadRequest(detail="Request Not Found")
-
-    if len(requests) != len(pick_list_input.request_ids):
-        errored_request_ids.append(set(pick_list_input.request_ids) - set(req.id for req in requests)) 
+    requests = get_requests_for_pick_list(session, pick_list_input.request_ids)
 
     # 2. Update Items Status
     item_ids = [request.item_id for request in requests if request.item_id is not None]
@@ -310,9 +331,6 @@ def create_pick_list(
         job_id=new_pick_list.id,
     )
     session.commit()
-
-    if errored_request_ids:
-        setattr(new_pick_list, "errored_request_ids", errored_request_ids)
 
     return sort_order_priority(session, new_pick_list, new_pick_list.requests)
 
@@ -569,30 +587,29 @@ def add_request_to_pick_list(
         raise BadRequest(detail="Pick List ID Not Found")
 
     pick_list = session.get(PickList, pick_list_id)
-    
-    if pick_list:
-        validate_assignment_lock(pick_list, current_user.id)
+
+    if not pick_list:
+        raise NotFound(detail=f"Pick List ID {pick_list_id} Not Found")
+
+    validate_assignment_lock(pick_list, current_user.id)
     update_dt = datetime.now(timezone.utc)
-    errored_request_ids = []
 
     if pick_list.status in ["Running", "Completed"]:
         raise BadRequest(
             detail="Can not add request to 'Running' or 'Completed' Pick List"
         )
 
-    if not pick_list:
-        raise NotFound(detail=f"Pick List ID {pick_list_id} Not Found")
-
     if not pick_list_input.request_ids:
         raise BadRequest(detail="Request IDs Not Found")
 
-    existing_requests = session.execute(
-        select(Request).where(Request.id.in_(pick_list_input.request_ids))
-    ).scalars().all()
+    existing_requests = get_requests_for_pick_list(session, pick_list_input.request_ids)
 
-    if len(existing_requests) != len(pick_list_input.request_ids):
-        errored_request_ids.append(
-            set(pick_list_input.request_ids) - set(req.id for req in existing_requests)
+    if pick_list.building_id and any(
+        request.building_id and request.building_id != pick_list.building_id
+        for request in existing_requests
+    ):
+        raise BadRequest(
+            detail=f"Pick List {pick_list_id} is for a different building than these requests"
         )
 
     session.execute(
@@ -634,9 +651,6 @@ def add_request_to_pick_list(
             entity_id=req.item_id or req.non_tray_item_id,
         )
     session.commit()
-
-    if errored_request_ids:
-        setattr(pick_list, "errored_request_ids", errored_request_ids)
 
     return sort_order_priority(session, pick_list, pick_list.requests)
 
@@ -765,6 +779,14 @@ def remove_request_from_pick_list(
 
     if not request:
         raise NotFound(detail=f"Request ID {request_id} Not Found")
+
+    if request.pick_list_id != pick_list_id:
+        raise NotFound(detail=f"Request ID {request_id} is not on Pick List ID {pick_list_id}")
+
+    if request.fulfilled:
+        raise BadRequest(
+            detail=f"Request ID {request_id} has already been retrieved and can not be removed"
+        )
 
     session.execute(
         update(Request).where(Request.id == request_id).values(
