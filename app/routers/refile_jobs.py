@@ -698,13 +698,20 @@ def remove_item_from_refile_job(
         
     validate_assignment_lock(refile_job, current_user.id)
 
+    if refile_job.status == "Completed":
+        raise BadRequest(
+            detail=f"Can not remove items from Refile Job ID {job_id} in 'Completed' status"
+        )
+
     # V2 FIX
     barcodes = (
         session.execute(select(Barcode).filter(Barcode.value.in_(lookup_barcode_values)))
         .scalars()
         .all()
     )
-    
+
+    # Find every item to remove before changing any, so a refused request changes nothing
+    removals = []
     for barcode in barcodes:
         # V2 FIX
         item = session.execute(select(Item).filter(Item.barcode_id == barcode.id)).scalars().first()
@@ -724,11 +731,7 @@ def remove_item_from_refile_job(
             )
 
             if refile_item:
-                session.delete(refile_item)
-                item.scanned_for_refile_queue = True
-                item.scanned_for_refile = False
-                item.scanned_for_refile_dt = None
-                item.update_dt = update_dt
+                removals.append((barcode, item, refile_item))
         elif non_tray_item:
             # V2 FIX
             refile_non_tray_item = (
@@ -742,11 +745,21 @@ def remove_item_from_refile_job(
             )
 
             if refile_non_tray_item:
-                session.delete(refile_non_tray_item)
-                non_tray_item.scanned_for_refile_queue = True
-                non_tray_item.scanned_for_refile = False
-                non_tray_item.scanned_for_refile_dt = None
-                non_tray_item.update_dt = update_dt
+                removals.append((barcode, non_tray_item, refile_non_tray_item))
+
+    # A refiled item is back on the shelf; returning it to the queue would ask for it to be refiled again
+    refiled_barcodes = [barcode.value for barcode, entity, _ in removals if entity.status == "In"]
+    if refiled_barcodes:
+        raise BadRequest(
+            detail=f"Refiled items can not be reverted to the queue: {', '.join(refiled_barcodes)}"
+        )
+
+    for barcode, entity, link in removals:
+        session.delete(link)
+        entity.scanned_for_refile_queue = True
+        entity.scanned_for_refile = False
+        entity.scanned_for_refile_dt = None
+        entity.update_dt = update_dt
 
     session.commit()
     session.refresh(refile_job)
