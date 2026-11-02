@@ -1,18 +1,22 @@
 """
 Refile job rules the API now enforces itself instead of trusting the screen:
 - reverting to the queue refuses refiled items and Completed jobs
+- each item reverted to the queue is recorded in the job's history
 """
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 
 from app.main import app as fastapi_app
 from app.auth.dependencies import get_current_user_with_permissions
+from app.models.audit_trails import AuditTrail
 from app.models.items import Item
 from app.models.non_tray_items import NonTrayItem
 from app.models.refile_items import RefileItem
 from app.models.refile_jobs import RefileJob
 from app.models.refile_non_tray_items import RefileNonTrayItem
+from app.services.audit_service import AuditEventType
 from tests.domain.test_batch_upload_request import uploader, warehouse  # noqa: F401
 
 
@@ -81,6 +85,17 @@ def _queued(session, entity):
     return session.get(type(entity), entity.id).scanned_for_refile_queue
 
 
+def _removal_entries(session, job_id):
+    session.expire_all()
+    return session.execute(
+        select(AuditTrail).where(
+            AuditTrail.job_type == "refile_jobs",
+            AuditTrail.job_id == str(job_id),
+            AuditTrail.event_type == AuditEventType.ITEM_REMOVED,
+        )
+    ).scalars().all()
+
+
 def test_revert_sends_pending_items_back_to_the_queue(staff, session, warehouse):  # noqa: F811
     item = _out(session, warehouse.tray_item())
     non_tray = _out(session, warehouse.non_tray())
@@ -93,6 +108,31 @@ def test_revert_sends_pending_items_back_to_the_queue(staff, session, warehouse)
     assert not _in_job(session, job_id, non_tray)
     assert _queued(session, item)
     assert _queued(session, non_tray)
+
+
+def test_revert_records_each_removal_in_the_history(staff, session, warehouse):  # noqa: F811
+    item = _out(session, warehouse.tray_item())
+    non_tray = _out(session, warehouse.non_tray())
+    job_id = _job(session, item, non_tray)
+
+    _revert(staff, job_id, item, non_tray)
+
+    entries = _removal_entries(session, job_id)
+    assert {(row.entity_type, row.entity_id) for row in entries} == {
+        ("items", str(item.id)),
+        ("non_tray_items", str(non_tray.id)),
+    }
+    assert any(item.barcode.value in row.description for row in entries)
+    assert any(non_tray.barcode.value in row.description for row in entries)
+
+
+def test_refused_revert_records_nothing(staff, session, warehouse):  # noqa: F811
+    pending = _out(session, warehouse.tray_item())
+    refiled = warehouse.tray_item()
+    job_id = _job(session, pending, refiled)
+
+    assert _revert(staff, job_id, pending, refiled).status_code == 400
+    assert _removal_entries(session, job_id) == []
 
 
 @pytest.mark.parametrize("kind", ["tray_item", "non_tray"])

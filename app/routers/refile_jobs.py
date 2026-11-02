@@ -760,6 +760,15 @@ def remove_item_from_refile_job(
         entity.scanned_for_refile = False
         entity.scanned_for_refile_dt = None
         entity.update_dt = update_dt
+        log_audit_event(
+            session,
+            AuditEventType.ITEM_REMOVED,
+            f"Item {barcode.value} removed from Refile Job {job_id} and returned to the refile queue",
+            job_type="refile_jobs",
+            job_id=job_id,
+            entity_type="items" if isinstance(entity, Item) else "non_tray_items",
+            entity_id=entity.id,
+        )
 
     session.commit()
     session.refresh(refile_job)
