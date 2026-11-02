@@ -2,6 +2,7 @@
 Refile job rules the API now enforces itself instead of trusting the screen:
 - reverting to the queue refuses refiled items and Completed jobs
 - each item reverted to the queue is recorded in the job's history
+- scans are taken only while the job is Running, and only for items in the job
 """
 from datetime import datetime, timezone
 
@@ -172,3 +173,72 @@ def test_revert_still_works_before_completion(staff, session, warehouse, status)
 
     assert _revert(staff, job_id, item).status_code == 200
     assert not _in_job(session, job_id, item)
+
+
+def _scan(client, job_id, entity):
+    if isinstance(entity, Item):
+        url = f"/refile-jobs/{job_id}/update_item/{entity.id}"
+    else:
+        url = f"/refile-jobs/{job_id}/update_non_tray_items/{entity.id}"
+    return client.patch(url, json={})
+
+
+def _status(session, entity):
+    session.expire_all()
+    return session.get(type(entity), entity.id).status
+
+
+@pytest.mark.parametrize("kind", ["tray_item", "non_tray"])
+def test_scan_refiles_an_item_in_a_running_job(staff, session, warehouse, kind):  # noqa: F811
+    entity = _out(session, getattr(warehouse, kind)())
+    job_id = _job(session, entity)
+
+    assert _scan(staff, job_id, entity).status_code == 200, "scan refused"
+    assert _status(session, entity) == "In"
+
+
+@pytest.mark.parametrize("kind", ["tray_item", "non_tray"])
+@pytest.mark.parametrize("status", ["Created", "Assigned", "Paused", "Completed"])
+def test_scan_refuses_a_job_that_is_not_running(staff, session, warehouse, kind, status):  # noqa: F811
+    entity = _out(session, getattr(warehouse, kind)())
+    job_id = _job(session, entity, status=status)
+
+    response = _scan(staff, job_id, entity)
+
+    assert response.status_code == 400
+    assert status in response.json()["detail"]
+    assert _status(session, entity) == "Out"
+
+
+@pytest.mark.parametrize("kind", ["tray_item", "non_tray"])
+def test_scan_refuses_an_item_not_in_the_job(staff, session, warehouse, kind):  # noqa: F811
+    stranger = _out(session, getattr(warehouse, kind)())
+    job_id = _job(session, _out(session, getattr(warehouse, kind)()))
+
+    response = _scan(staff, job_id, stranger)
+
+    assert response.status_code == 400
+    assert f"not in Refile Job ID {job_id}" in response.json()["detail"]
+    assert _status(session, stranger) == "Out"
+
+
+def test_scan_refuses_an_item_reverted_by_someone_else(staff, session, warehouse):  # noqa: F811
+    item = _out(session, warehouse.tray_item())
+    job_id = _job(session, item)
+    assert _revert(staff, job_id, item).status_code == 200
+
+    # a second worker's screen still lists the item and scans it
+    assert _scan(staff, job_id, item).status_code == 400
+    assert _status(session, item) == "Out"
+    assert _queued(session, item)
+
+
+def test_scan_uses_the_item_type_of_the_endpoint(staff, session, warehouse):  # noqa: F811
+    # a tray item's id sent to the non-tray endpoint must not refile a non-tray item with that id
+    item = _out(session, warehouse.tray_item())
+    job_id = _job(session, item)
+
+    response = staff.patch(f"/refile-jobs/{job_id}/update_non_tray_items/{item.id}", json={})
+
+    assert response.status_code in (400, 404)
+    assert _status(session, item) == "Out"

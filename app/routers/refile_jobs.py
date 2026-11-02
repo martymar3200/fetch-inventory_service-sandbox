@@ -45,6 +45,14 @@ router = APIRouter(
 )
 
 
+def require_running(refile_job):
+    # Scans count as work only while the job is Running; a paused or finished job takes none
+    if refile_job.status != "Running":
+        raise BadRequest(
+            detail=f"Can not scan items in Refile Job ID {refile_job.id} in '{refile_job.status}' status"
+        )
+
+
 def sort_order_priority(session: Session, item_type, item):
     if item_type == "item":
         tray = session.get(Tray, item.tray_id)
@@ -796,12 +804,19 @@ def update_item_in_refile_job(
         raise NotFound(detail=f"Refile Job ID {job_id} not found")
         
     validate_assignment_lock(refile_job, current_user.id)
+    require_running(refile_job)
 
     # V2 FIX
     existing_item = session.execute(select(Item).filter(Item.id == item_id)).scalars().first()
 
     if not existing_item:
         raise NotFound(detail=f"Item ID {item_id} not found")
+
+    in_job = session.execute(
+        select(RefileItem.id).filter(RefileItem.refile_job_id == job_id, RefileItem.item_id == item_id)
+    ).first()
+    if not in_job:
+        raise BadRequest(detail=f"Item ID {item_id} is not in Refile Job ID {job_id}")
 
     # Update the item record with the mutated data
     update_dt = datetime.now(timezone.utc)
@@ -854,6 +869,8 @@ def update_non_tray_item_in_refile_job(
     if not refile_job:
         raise NotFound(detail=f"Refile Job ID {job_id} not found")
 
+    require_running(refile_job)
+
     # V2 FIX
     existing_item = (
         session.execute(select(NonTrayItem).filter(NonTrayItem.id == non_tray_item_id))
@@ -863,6 +880,15 @@ def update_non_tray_item_in_refile_job(
 
     if not existing_item:
         raise NotFound(detail=f"Non Tray Item ID {non_tray_item_id} not found")
+
+    in_job = session.execute(
+        select(RefileNonTrayItem.id).filter(
+            RefileNonTrayItem.refile_job_id == job_id,
+            RefileNonTrayItem.non_tray_item_id == non_tray_item_id,
+        )
+    ).first()
+    if not in_job:
+        raise BadRequest(detail=f"Non Tray Item ID {non_tray_item_id} is not in Refile Job ID {job_id}")
 
     # Update the item record with the mutated data
     update_dt = datetime.now(timezone.utc)
