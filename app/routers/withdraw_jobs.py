@@ -414,6 +414,8 @@ def update_withdraw_job(
                 empty_trays = [tray for tray in trays if len(tray.items) == 0]
 
                 if empty_trays:
+                    # Only emptied trays leave the shelf; trays still holding items stay put
+                    empty_tray_ids = [tray.id for tray in empty_trays]
                     tray_barcode_ids = [tray.barcode_id for tray in empty_trays]
                     
                     session.execute(
@@ -439,7 +441,7 @@ def update_withdraw_job(
                         ).outerjoin(
                             TrayBarcodeAlias, Tray.barcode_id == TrayBarcodeAlias.id
                         ).filter(
-                            Tray.id.in_(tray_ids)
+                            Tray.id.in_(empty_tray_ids)
                         )
                     ).all()
 
@@ -464,8 +466,9 @@ def update_withdraw_job(
                             withdrawal_dt=updated_dt,
                             update_dt=updated_dt,
                         ))
+                    # The tray left its position, so that shelf gains a space
                     for tray in trays_to_update:
-                        update_shelf_space_after_tray(session, tray, tray.shelf_position_id, None)
+                        update_shelf_space_after_tray(session, None, None, tray.shelf_position_id)
 
         if non_tray_item_ids:
             non_tray_items_to_update = session.execute(
