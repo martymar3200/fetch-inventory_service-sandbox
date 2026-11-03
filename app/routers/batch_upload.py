@@ -673,7 +673,7 @@ async def batch_upload_withdraw_job(
             file_name=file_name,
             file_size=file_size,
             file_type=file_content_type,
-            type="Withdraw",
+            # withdraw uploads are identified by withdraw_job_id; there is no type column
             withdraw_job_id=withdraw_job.id,
         )
 
