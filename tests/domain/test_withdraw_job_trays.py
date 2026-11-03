@@ -9,6 +9,7 @@ from app.models.items import Item, ItemStatus
 from app.models.shelf_positions import ShelfPosition
 from app.models.shelves import Shelf
 from app.models.trays import Tray
+from app.models.withdraw_jobs import WithdrawJob
 from tests.domain.test_batch_upload_request import uploader, warehouse  # noqa: F401
 from tests.domain.test_move_discrepancies import _make_item
 from tests.domain.test_withdraw_job_updates import staff  # noqa: F401
@@ -25,7 +26,12 @@ def _add(client, job_id, barcode):
     assert response.status_code == 200, response.text
 
 
-def _complete(client, job_id):
+def _complete(client, session, job_id):
+    # the job's items have been pulled; items left in a shared tray stay In
+    session.expire_all()
+    for item in session.get(WithdrawJob, job_id).items:
+        item.status = ItemStatus.Out
+    session.commit()
     response = client.patch(f"/withdraw-jobs/{job_id}", json={"status": "Completed"})
     assert response.status_code == 200, response.text
 
@@ -57,7 +63,7 @@ def test_a_tray_that_still_holds_items_stays_shelved(staff, session, warehouse):
     _add(staff, job_id, lone.barcode.value)
     _add(staff, job_id, shared.barcode.value)
 
-    _complete(staff, job_id)
+    _complete(staff, session, job_id)
 
     session.expire_all()
     tray = session.get(Tray, shared_tray_id)
@@ -80,7 +86,7 @@ def test_an_emptied_tray_is_withdrawn(staff, session, warehouse):  # noqa: F811
     _add(staff, job_id, lone.barcode.value)
     _add(staff, job_id, shared.barcode.value)
 
-    _complete(staff, job_id)
+    _complete(staff, session, job_id)
 
     session.expire_all()
     tray = session.get(Tray, tray_id)
@@ -98,7 +104,7 @@ def test_withdrawing_a_tray_frees_its_shelf_space(staff, session, warehouse):  #
     job_id = _new_job(staff)
     _add(staff, job_id, item.barcode.value)
 
-    _complete(staff, job_id)
+    _complete(staff, session, job_id)
 
     assert _space(session, shelf_id) == before + 1
 
@@ -113,7 +119,7 @@ def test_a_tray_left_on_the_shelf_keeps_its_space_count(staff, session, warehous
     _add(staff, job_id, lone.barcode.value)
     _add(staff, job_id, shared.barcode.value)
 
-    _complete(staff, job_id)
+    _complete(staff, session, job_id)
 
     assert _space(session, lone_shelf) == lone_before + 1
     assert _space(session, shared_shelf) == shared_before

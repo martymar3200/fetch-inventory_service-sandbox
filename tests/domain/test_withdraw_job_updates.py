@@ -53,6 +53,14 @@ def _job(session, *items):
     return job.id
 
 
+def _out_job(session, *items):
+    """A job whose items have been pulled (Out), so it may be completed."""
+    for item in items:
+        session.get(Item, item.id).status = ItemStatus.Out
+    session.commit()
+    return _job(session, *items)
+
+
 def _worker(session):
     user = User(first_name="Other", last_name="Worker", email=f"{uuid.uuid4().hex[:10]}@t.test")
     session.add(user)
@@ -81,7 +89,7 @@ def _audit_messages(session, job_id, fragment):
 
 def test_complete_withdraws_items_and_saves_the_status(staff, session, warehouse):  # noqa: F811
     item = warehouse.tray_item()
-    job_id = _job(session, item)
+    job_id = _out_job(session, item)
 
     body = _patch(staff, job_id, status="Completed", assigned_user_id=_worker(session).id)
 
@@ -91,7 +99,7 @@ def test_complete_withdraws_items_and_saves_the_status(staff, session, warehouse
 
 
 def test_complete_moves_the_job_out_of_the_open_queue(staff, session, warehouse):  # noqa: F811
-    job_id = _job(session, warehouse.tray_item())
+    job_id = _out_job(session, warehouse.tray_item())
     assert staff.get(f"/withdraw-jobs/?queue=true&workflow_id={job_id}").json()["total"] == 1
 
     _patch(staff, job_id, status="Completed")
@@ -123,7 +131,7 @@ def test_unassigning_returns_the_job_to_created(staff, session, warehouse):  # n
 
 
 def test_audit_trail_matches_what_was_saved(staff, session, warehouse):  # noqa: F811
-    job_id = _job(session, warehouse.tray_item())
+    job_id = _out_job(session, warehouse.tray_item())
 
     _patch(staff, job_id, status="Running")
     _patch(staff, job_id, status="Completed")
@@ -135,7 +143,7 @@ def test_audit_trail_matches_what_was_saved(staff, session, warehouse):  # noqa:
 
 def test_repeating_complete_changes_nothing(staff, session, warehouse):  # noqa: F811
     item = warehouse.tray_item()
-    job_id = _job(session, item)
+    job_id = _out_job(session, item)
     _patch(staff, job_id, status="Completed")
     session.expire_all()
     withdrawn_barcode = session.get(Item, item.id).withdrawn_barcode_id
@@ -157,7 +165,7 @@ def test_repeating_complete_changes_nothing(staff, session, warehouse):  # noqa:
     {"add_to_picklist": True},
 ])
 def test_completed_job_can_not_reopen_or_take_on_more(staff, session, warehouse, fields):  # noqa: F811
-    job_id = _job(session, warehouse.tray_item())
+    job_id = _out_job(session, warehouse.tray_item())
     _patch(staff, job_id, status="Completed")
 
     response = staff.patch(f"/withdraw-jobs/{job_id}", json=fields)
@@ -167,7 +175,7 @@ def test_completed_job_can_not_reopen_or_take_on_more(staff, session, warehouse,
 
 
 def test_completed_job_can_not_be_deleted(staff, session, warehouse):  # noqa: F811
-    job_id = _job(session, warehouse.tray_item())
+    job_id = _out_job(session, warehouse.tray_item())
     _patch(staff, job_id, status="Completed")
 
     assert staff.delete(f"/withdraw-jobs/{job_id}").status_code == 400

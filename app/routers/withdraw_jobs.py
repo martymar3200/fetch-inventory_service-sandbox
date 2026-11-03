@@ -87,6 +87,30 @@ def validate_withdraw_item(items: List[ItemWithdrawal | NonTrayItemWithdrawal], 
     )
 
 
+def check_ready_to_withdraw(withdraw_job: WithdrawJob):
+    """
+    Refuse to complete a job until its items have been pulled. The screen checks this
+    too, but it can be out of date (another user adding an item, a pick list changing),
+    so the API has the final say.
+    """
+    entries = list(withdraw_job.items) + list(withdraw_job.non_tray_items)
+    if not entries:
+        raise BadRequest(detail=f"Withdraw job id {withdraw_job.id} has no items to withdraw")
+
+    if withdraw_job.pick_list_id and (
+        not withdraw_job.pick_list or withdraw_job.pick_list.status != "Completed"
+    ):
+        raise BadRequest(
+            detail=f"Pick list {withdraw_job.pick_list_id} must be completed before withdrawing"
+        )
+
+    not_out = [entry for entry in entries if entry.status not in ("Out", "Withdrawn")]
+    if not_out:
+        barcodes = [entry.barcode.value if entry.barcode else str(entry.id) for entry in not_out]
+        shown = ", ".join(barcodes[:10]) + (f" and {len(barcodes) - 10} more" if len(barcodes) > 10 else "")
+        raise BadRequest(detail=f"These items must be Out before withdrawing: {shown}")
+
+
 @router.get("/", response_model=Page[WithdrawJobListOutput])
 def get_withdraw_job_list(
     session: Session = Depends(get_session),
@@ -205,6 +229,9 @@ def update_withdraw_job(
         or withdraw_job_input.add_to_picklist
     ):
         raise BadRequest(detail=f"Withdraw job id {id} is already completed")
+
+    if withdraw_job_input.status == "Completed" and original_status != "Completed":
+        check_ready_to_withdraw(existing_withdraw_job)
 
     # Handle auto-assignment when user starts job
     if withdraw_job_input.status:
