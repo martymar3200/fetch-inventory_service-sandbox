@@ -943,7 +943,8 @@ def remove_items_from_withdraw_job(
             session.execute(delete(Request).where(Request.id == request_non_tray_item.id))
 
         session.execute(delete(NonTrayItemWithdrawal).where(
-            NonTrayItemWithdrawal.non_tray_item_id == non_tray_item.id, withdraw_job_id == job_id
+            NonTrayItemWithdrawal.non_tray_item_id == non_tray_item.id,
+            NonTrayItemWithdrawal.withdraw_job_id == job_id,
         ))
         session.execute(update(NonTrayItem).filter(NonTrayItem.id == non_tray_item.id).values(
             status=(
@@ -976,7 +977,7 @@ def remove_items_from_withdraw_job(
                 session.execute(delete(Request).where(Request.id == request_item.id))
 
             session.execute(delete(ItemWithdrawal).where(
-                ItemWithdrawal.item_id == item.id, withdraw_job_id == job_id
+                ItemWithdrawal.item_id == item.id, ItemWithdrawal.withdraw_job_id == job_id
             ))
             session.execute(update(Item).filter(Item.id == item.id).values(
                 status=(
