@@ -662,11 +662,13 @@ async def batch_upload_withdraw_job(
                 dtype={"Item Barcode": str, "Tray Barcode": str},
             )
 
-        # Check if the necessary column exists
         withdraw_job = session.get(WithdrawJob, job_id)
 
         if not withdraw_job:
             raise NotFound(detail=f"Withdraw job id {job_id} not found")
+
+        if withdraw_job.status == "Completed":
+            raise BadRequest(detail="Withdraw job has already been completed")
 
         # Create a new batch upload
         new_batch_upload = BatchUpload(
@@ -681,54 +683,35 @@ async def batch_upload_withdraw_job(
         session.commit()
         session.refresh(new_batch_upload)
 
-        # Remove rows with NaN values in 'Item Barcode' and 'Tray Barcode'
-        df = df.dropna(subset=["Item Barcode", "Tray Barcode"], how="all")
-
-        if not withdraw_job:
-            # V2 UPDATE FIX
+        def mark_upload_failed():
             session.execute(
                 update(BatchUpload)
                 .where(BatchUpload.id == new_batch_upload.id)
                 .values(status="Failed", update_dt=datetime.now(timezone.utc))
             )
             session.commit()
-            raise NotFound(detail=f"Withdraw job id {job_id} not found")
 
-        if "Item Barcode" not in df.columns and "Tray Barcode" not in df.columns:
-            # V2 UPDATE FIX
-            session.execute(
-                update(BatchUpload)
-                .where(BatchUpload.id == new_batch_upload.id)
-                .values(status="Failed", update_dt=datetime.now(timezone.utc))
-            )
-            session.commit()
+        barcode_columns = [
+            column for column in ("Item Barcode", "Tray Barcode") if column in df.columns
+        ]
+        if not barcode_columns:
+            mark_upload_failed()
             raise BadRequest(
                 detail="Batch file must contain a 'Item Barcode' or 'Tray "
                 "Barcode' columns."
             )
 
-        # Drop NaN and empty string values
-        item_df = df["Item Barcode"].replace("", pd.NA).dropna()
+        # (line in the file, barcode). Line 1 is the header, so the first row is line 2.
+        rows = []
+        for index, row in df[barcode_columns].iterrows():
+            for column in barcode_columns:
+                value = row[column]
+                if pd.isna(value) or not str(value).strip():
+                    continue
+                rows.append((int(index) + 2, str(value).strip()))
 
-        # Reset the index if necessary
-        item_df.reset_index(drop=True, inplace=True)
-
-        # Create DataFrame
-        item_df = pd.DataFrame(item_df)
-        # rename columns
-        item_df.rename(columns={"Item Barcode": "Barcode"}, inplace=True)
-
-        lookup_barcode_values = []
-        if not item_df["Barcode"].empty:
-            lookup_barcode_values.extend(item_df["Barcode"].astype(str).tolist())
-
-        if not lookup_barcode_values:
-            # V2 UPDATE FIX
-            session.execute(
-                update(BatchUpload)
-                .where(BatchUpload.id == new_batch_upload.id)
-                .values(status="Failed", update_dt=datetime.now(timezone.utc))
-            )
+        if not rows:
+            mark_upload_failed()
             raise NotFound(
                 detail="All barcodes are invalid to process bulk withdraw upload. Please check your barcodes and try again."
             )
@@ -741,52 +724,12 @@ async def batch_upload_withdraw_job(
         )
         session.commit()
 
-        lookup_barcode_values = list(set(lookup_barcode_values))
-        # V2 FIX: session.query().filter().all() -> session.execute(select(...)).scalars().all()
-        barcodes = (
-            session.execute(select(Barcode)
-            .filter(Barcode.value.in_(lookup_barcode_values)))
-            .scalars()
-            .all()
-        )
-
-        found_barcodes = set(barcode.value for barcode in barcodes)
-        missing_barcodes = set(lookup_barcode_values) - found_barcodes
-
-        errored_barcodes = {"errors": []}
-
-        for barcode in missing_barcodes:
-            index = item_df.index[item_df["Barcode"] == barcode].tolist()
-            if index:
-                errored_barcodes["errors"].append(
-                    {
-                        "line": index[0] + 1,
-                        "error": f"Barcode value {barcode} not found",
-                    }
-                )
-
-        if not barcodes:
-            # V2 UPDATE FIX
-            session.execute(
-                update(BatchUpload)
-                .where(BatchUpload.id == new_batch_upload.id)
-                .values(status="Failed", update_dt=datetime.now(timezone.utc))
-            )
-            session.commit()
-            raise BadRequest(
-                detail="All barcodes are invalid to process bulk withdraw upload. Please check your barcodes and try again."
-            )
-
         (
             withdraw_items,
             withdraw_non_tray_items,
             withdraw_trays,
-            errored_barcodes_from_processing,
-        ) = process_withdraw_job_data(session, withdraw_job.id, barcodes, df)
-
-        errored_barcodes["errors"].extend(
-            errored_barcodes_from_processing.get("errors", [])
-        )
+            errored_barcodes,
+        ) = process_withdraw_job_data(session, withdraw_job.id, rows)
 
         if not withdraw_items and not withdraw_non_tray_items and not withdraw_trays:
             if not errored_barcodes.get("errors"):

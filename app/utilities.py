@@ -1339,53 +1339,39 @@ def validate_container_not_shelved(item):
     return False
 
 
-def _validate_withdraw_item(session, item, withdraw_job_id, barcode, index, errors):
-    item_errors = []
-
-    _validate_item_status(
-        item, index, item_errors, "Item must have status of ['In', 'Out']"
-    )
-    shelf_position = session.scalars(
-        select(ShelfPosition).join(Tray).where(Tray.id == item.tray_id)
-    ).first()
-    if validate_item_not_shelved(shelf_position):
-        errors.append({"line": int(index), "error": "Item is not shelved"})
-    
-    existing_withdrawals = session.scalars(
-        select(WithdrawJob)
-        .join(ItemWithdrawal, WithdrawJob.id == ItemWithdrawal.withdraw_job_id)
-        .where(ItemWithdrawal.item_id == item.id)
-    ).all()
-    if _validate_withdraw_job_existing_item(
-        existing_withdrawals, withdraw_job_id, "Completed"
-    ):
-        item_errors.append(
-            {"line": int(index), "error": "Item is in existing withdraw job"}
-        )
-
-    if not item_errors:
-        return (
-            ItemWithdrawal(item_id=item.id, withdraw_job_id=withdraw_job_id),
-            item_errors,
-        )
-    else:
-        errors.extend(item_errors)
-        return None, item_errors
+def _withdraw_jobs_holding(session: Session, link_model, id_column, ids) -> Dict[int, set]:
+    """{entity id: ids of the not-yet-completed withdraw jobs it is in}."""
+    if not ids:
+        return {}
+    holding = {}
+    for entity_id, job_id in session.execute(
+        select(id_column, link_model.withdraw_job_id)
+        .join(WithdrawJob, WithdrawJob.id == link_model.withdraw_job_id)
+        .where(id_column.in_(list(ids)), WithdrawJob.status != COMPLETED_STATUS)
+    ).all():
+        holding.setdefault(entity_id, set()).add(job_id)
+    return holding
 
 
 def process_withdraw_job_data(
-    session: Session, withdraw_job_id: int, barcodes: List, df: pd.DataFrame
+    session: Session, withdraw_job_id: int, rows: List[Tuple[int, str]]
 ) -> Tuple[List, List, List, Dict]:
+    """
+    Check each row of a withdraw Bulk Upload with the same rules as scanning that barcode
+    into the job, and build the links for the rows that pass. rows are (line in the file,
+    barcode value); a barcode may be an item, a non-tray item or a tray, whichever column
+    it is in, as with a scan. Rows that fail are reported by line and not added.
+    """
     errors = []
-    withdraw_items = []
-    withdraw_non_tray_items = []
-    withdraw_trays = []
+    withdraw_items, withdraw_non_tray_items, withdraw_trays = [], [], []
     update_dt = datetime.now(timezone.utc)
 
-    # Collect all barcode ids
-    barcode_ids = [barcode.id for barcode in barcodes]
-
-    # Fetch all necessary data in batch
+    values = {value for _, value in rows}
+    barcodes = {
+        barcode.value: barcode
+        for barcode in session.scalars(select(Barcode).where(Barcode.value.in_(values))).all()
+    }
+    barcode_ids = [barcode.id for barcode in barcodes.values()]
     items = {
         item.barcode_id: item
         for item in session.scalars(select(Item).where(Item.barcode_id.in_(barcode_ids))).all()
@@ -1396,98 +1382,127 @@ def process_withdraw_job_data(
             select(NonTrayItem).where(NonTrayItem.barcode_id.in_(barcode_ids))
         ).all()
     }
+    trays = {
+        tray.barcode_id: tray
+        for tray in session.scalars(select(Tray).where(Tray.barcode_id.in_(barcode_ids))).all()
+    }
 
-    # Fetch existing withdrawals in one batch query
-    existing_withdrawals = {
-        non_tray_item_id: withdraw_job_id
-        for non_tray_item_id, withdraw_job_id in session.execute(
-            select(
-                NonTrayItemWithdrawal.non_tray_item_id,
-                NonTrayItemWithdrawal.withdraw_job_id,
-            )
-            .where(
-                NonTrayItemWithdrawal.non_tray_item_id.in_(
-                    [item.id for item in non_tray_items.values()]  # Extract `id` values
-                )
-            )
+    item_ids = {item.id for item in items.values()}
+    item_ids |= {item.id for tray in trays.values() for item in tray.items}
+    item_jobs = _withdraw_jobs_holding(session, ItemWithdrawal, ItemWithdrawal.item_id, item_ids)
+    non_tray_jobs = _withdraw_jobs_holding(
+        session,
+        NonTrayItemWithdrawal,
+        NonTrayItemWithdrawal.non_tray_item_id,
+        {non_tray_item.id for non_tray_item in non_tray_items.values()},
+    )
+    linked_trays = set(
+        session.scalars(
+            select(TrayWithdrawal.tray_id).where(TrayWithdrawal.withdraw_job_id == withdraw_job_id)
         ).all()
-    }
+    )
 
-    # ... (rest of function is untouched) ...
-    # Use a set for duplicate checks in withdraw_trays
-    withdraw_tray_set = {(tw.tray_id, tw.withdraw_job_id) for tw in withdraw_trays}
+    first_line = {}  # barcode value -> line it was first listed on
+    added_items = set()
 
-    # Create a lookup dictionary for barcodes in the DataFrame for retrieval
-    barcode_to_index = {
-        str(value): idx for idx, value in enumerate(df["Item Barcode"].astype(str))
-    }
+    def in_jobs_problem(jobs, label):
+        if withdraw_job_id in jobs:
+            return f"{label} is already in this withdraw job"
+        if jobs:
+            return f"{label} is in another withdraw job"
+        return None
 
-    for barcode in barcodes:
-        item = items.get(barcode.id)
-        non_tray_item = non_tray_items.get(barcode.id)
+    def item_problem(item, label):
+        if item.status in INVALID_STATUSES:
+            return f"{label} is {item.status}; only In or Out items can be withdrawn"
+        if not item.tray or not item.tray.shelf_position_id or not item.tray.scanned_for_shelving:
+            return f"{label} is not shelved"
+        return in_jobs_problem(item_jobs.get(item.id, set()), label)
 
-        # Get the index from preprocessed barcode_to_index dictionary
-        index = barcode_to_index.get(str(barcode.value), None)
-        if index is None:
-            errors.append({"error": f"Barcode {barcode.value} not found"})
+    def link_tray(tray_id):
+        if tray_id not in linked_trays:
+            linked_trays.add(tray_id)
+            withdraw_trays.append(TrayWithdrawal(tray_id=tray_id, withdraw_job_id=withdraw_job_id))
+
+    def add_item(item):
+        added_items.add(item.id)
+        withdraw_items.append(ItemWithdrawal(item_id=item.id, withdraw_job_id=withdraw_job_id))
+        item.update_dt = update_dt
+        session.add(item)
+
+    for line, value in rows:
+        if value in first_line:
+            errors.append({"line": line, "error": f"{value} is already listed on line {first_line[value]}"})
             continue
+        first_line[value] = line
+
+        barcode = barcodes.get(value)
+        item = items.get(barcode.id) if barcode else None
+        non_tray_item = non_tray_items.get(barcode.id) if barcode else None
+        tray = trays.get(barcode.id) if barcode else None
 
         if item:
-            item_withdrawal, item_errors = _validate_withdraw_item(
-                session, item, withdraw_job_id, barcode, index + 1, errors
-            )
-            if item_withdrawal:
-                withdraw_items.append(item_withdrawal)
-                new_tray_withdrawal = TrayWithdrawal(
-                    tray_id=item.tray_id, withdraw_job_id=withdraw_job_id
-                )
-
-                # Check if the tray_id and withdraw_job_id already exist in withdraw_trays
-                # Use a set for faster lookup instead of `any()`
-                if (
-                    new_tray_withdrawal.tray_id,
-                    new_tray_withdrawal.withdraw_job_id,
-                ) not in withdraw_tray_set:
-                    withdraw_tray_set.add(
-                        (
-                            new_tray_withdrawal.tray_id,
-                            new_tray_withdrawal.withdraw_job_id,
-                        )
-                    )
-                    withdraw_trays.append(new_tray_withdrawal)
-
-                item.update_dt = update_dt
-                session.add(item)
-        elif non_tray_item:
-            _validate_item_status(
-                non_tray_item,
-                index + 1,
-                errors,
-                "Non Tray Item must have status of ['In', 'Out']",
-            )
-            if existing_withdrawals.get(non_tray_item.id) == withdraw_job_id:
-                errors.append(
-                    {
-                        "line": int(index) + 2,
-                        "error": "Non Tray Item is in existing withdraw job",
-                    }
-                )
-            elif validate_container_not_shelved(non_tray_item):
-                errors.append(
-                    {"line": int(index) + 2, "error": "Non Tray Item is not shelved"}
-                )
+            label = f"Item {value}"
+            if item.id in added_items:
+                problem = f"{label} is already listed in a tray on this file"
             else:
-                withdraw_non_tray_items.append(
-                    NonTrayItemWithdrawal(
-                        non_tray_item_id=non_tray_item.id,
-                        withdraw_job_id=withdraw_job_id,
-                    )
-                )
-                non_tray_item.update_dt = update_dt
-                session.add(non_tray_item)
-        else:
-            errors.append({"line": int(index) + 2, "error": "Barcode not found"})
+                problem = item_problem(item, label)
+            if problem:
+                errors.append({"line": line, "error": problem})
+                continue
+            add_item(item)
+            link_tray(item.tray_id)
 
+        elif non_tray_item:
+            label = f"Non Tray Item {value}"
+            if non_tray_item.status in INVALID_STATUSES:
+                problem = f"{label} is {non_tray_item.status}; only In or Out items can be withdrawn"
+            elif validate_container_not_shelved(non_tray_item):
+                problem = f"{label} is not shelved"
+            else:
+                problem = in_jobs_problem(non_tray_jobs.get(non_tray_item.id, set()), label)
+            if problem:
+                errors.append({"line": line, "error": problem})
+                continue
+            withdraw_non_tray_items.append(
+                NonTrayItemWithdrawal(non_tray_item_id=non_tray_item.id, withdraw_job_id=withdraw_job_id)
+            )
+            non_tray_item.update_dt = update_dt
+            session.add(non_tray_item)
+
+        elif tray:
+            label = f"Tray {value}"
+            if not tray.items:
+                errors.append({"line": line, "error": f"{label} is empty"})
+                continue
+            if validate_container_not_shelved(tray):
+                errors.append({"line": line, "error": f"{label} is not shelved"})
+                continue
+            # as with a scan, one item that can't be withdrawn refuses the whole tray;
+            # items already in this job (or earlier in this file) are simply kept
+            to_add, problems = [], []
+            for tray_item in tray.items:
+                if tray_item.id in added_items or withdraw_job_id in item_jobs.get(tray_item.id, set()):
+                    continue
+                problem = item_problem(tray_item, f"Item {tray_item.barcode.value if tray_item.barcode else tray_item.id}")
+                if problem:
+                    problems.append(problem)
+                else:
+                    to_add.append(tray_item)
+            if problems:
+                errors.append({"line": line, "error": f"{label} not added: " + "; ".join(problems)})
+                continue
+            if not to_add:
+                errors.append({"line": line, "error": f"{label} is already in this withdraw job"})
+                continue
+            for tray_item in to_add:
+                add_item(tray_item)
+            link_tray(tray.id)
+
+        else:
+            errors.append({"line": line, "error": f"Barcode {value} not found"})
+
+    errors.sort(key=lambda error: error["line"])
     return withdraw_items, withdraw_non_tray_items, withdraw_trays, {"errors": errors}
 
 
