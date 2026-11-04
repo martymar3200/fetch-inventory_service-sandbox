@@ -640,47 +640,22 @@ def delete_withdraw_job(job_id: int, session: Session = Depends(get_session)):
     if withdraw_job.status == "Completed":
         raise BadRequest(detail=f"Withdraw job id {job_id} is already completed")
 
+    # Its items are still on that pick list; deleting the job would strand them in PickList
+    if withdraw_job.pick_list_id and withdraw_job.pick_list and withdraw_job.pick_list.status != "Completed":
+        raise BadRequest(
+            detail=f"Pick list {withdraw_job.pick_list_id} for this job is still open. "
+            "Complete or delete it before deleting the job."
+        )
+
+    # Only the links go. A job that isn't Completed has withdrawn nothing, so its items
+    # have no withdrawal fields to undo. (The old undo loop set barcode_id to the empty
+    # withdrawn_barcode_id, which the items check constraint refused with a 500.)
     withdrawal_models = [ItemWithdrawal, NonTrayItemWithdrawal, TrayWithdrawal]
     for model in withdrawal_models:
         session.execute(delete(model).where(model.withdraw_job_id == job_id))
-
-    if withdraw_job.items:
-        for item in withdraw_job.items:
-            session.execute(update(Item).filter(Item.id == item.id).values(
-                update_dt=update_dt,
-                withdrawal_dt=None,
-                barcode_id=item.withdrawn_barcode_id,
-                withdrawn_barcode_id=None,
-                withdrawn_location=None,
-                withdrawn_internal_location=None,
-                withdrawn_loc_bcodes=None,
-            ))
-    if withdraw_job.non_tray_items:
-        for non_tray_item in withdraw_job.non_tray_items:
-            session.execute(update(NonTrayItem).filter(
-                NonTrayItem.id == non_tray_item.id
-            ).values(
-                update_dt=update_dt,
-                withdrawal_dt=None,
-                barcode_id=non_tray_item.withdrawn_barcode_id,
-                withdrawn_barcode_id=None,
-                withdrawn_location=None,
-                withdrawn_internal_location=None,
-                withdrawn_loc_bcodes=None,
-            ))
-
-    if withdraw_job.trays:
-        for tray in withdraw_job.trays:
-            for item in tray.items:
-                session.execute(update(Item).filter(Item.id == item.id).values(
-                    update_dt=update_dt,
-                    withdrawal_dt=None,
-                    barcode_id=item.withdrawn_barcode_id,
-                    withdrawn_barcode_id=None,
-                    withdrawn_location=None,
-                    withdrawn_internal_location=None,
-                    withdrawn_loc_bcodes=None,
-                ))
+    # forget any copies of those links already loaded, so deleting the job doesn't
+    # try to remove them a second time
+    session.expire(withdraw_job, ["items", "non_tray_items", "trays"])
 
     existing_batch_upload = session.execute(select(BatchUpload).where(
         BatchUpload.withdraw_job_id == job_id)).scalars().first()
