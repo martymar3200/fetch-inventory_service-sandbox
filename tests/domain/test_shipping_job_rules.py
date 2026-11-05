@@ -488,3 +488,49 @@ def test_list_finds_a_job_by_number(shipper):
     ids = [_new_job(shipper) for _ in range(2)]
 
     assert _list_ids(shipper, workflow_id=ids[1]) == [ids[1]]
+
+
+# --- Item 11: removing an item returns the bin; an empty job can't complete ---
+
+def test_remove_returns_the_updated_bin(shipper, session, warehouse):
+    location = _location(session)
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    first, second = _ready_item(session, warehouse, location), _ready_item(session, warehouse, location)
+    assert _scan_item(shipper, job_id, bin_id, first).status_code == 200
+    assert _scan_item(shipper, job_id, bin_id, second).status_code == 200
+
+    response = shipper.delete(f"/shipping-jobs/{job_id}/bins/{bin_id}/items/{first.id}")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == bin_id
+    assert body["item_count"] == 1
+    assert [i["id"] for i in body["items"]] == [second.id]
+    assert body["delivery_location_id"] == location.id
+
+
+def test_emptied_bin_takes_the_next_items_destination(shipper, session, warehouse):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    first = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, first).status_code == 200
+
+    response = shipper.delete(f"/shipping-jobs/{job_id}/bins/{bin_id}/items/{first.id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["item_count"] == 0
+    assert response.json()["delivery_location_id"] is None
+    # an item for somewhere else now fits
+    assert _scan_item(shipper, job_id, bin_id, _ready_item(session, warehouse)).status_code == 200
+
+
+def test_job_with_no_items_can_not_complete(shipper, session):
+    job_id = _new_job(shipper)
+    _scan_bin(shipper, job_id)
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}/complete")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"Shipping Job {job_id} has no items to ship"
+    assert _job(session, job_id).status == ShippingJobStatus.Running

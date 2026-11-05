@@ -95,6 +95,17 @@ def _bins_with_contents():
     ]
 
 
+def _bin_detail(session: Session, bin_id: int) -> ShippingBin:
+    """A bin with its items, barcodes and destination, as the scan screen shows it."""
+    return session.execute(
+        select(ShippingBin).where(ShippingBin.id == bin_id).options(
+            selectinload(ShippingBin.items).selectinload(Item.barcode),
+            selectinload(ShippingBin.non_tray_items).selectinload(NonTrayItem.barcode),
+            selectinload(ShippingBin.delivery_location),
+        ).execution_options(populate_existing=True)
+    ).scalars().first()
+
+
 def job_output(job: ShippingJob) -> ShippingJobOutput:
     """
     A Completed job shows what its bins held when it was completed
@@ -636,7 +647,11 @@ def scan_item_into_bin(
     bin_obj = session.execute(bin_query).scalars().first()
     return bin_obj
 
-@router.delete("/{id}/bins/{bin_id}/items/{item_id}", dependencies=[Depends(RequiresPermission("process_shipping_jobs"))])
+@router.delete(
+    "/{id}/bins/{bin_id}/items/{item_id}",
+    response_model=ShippingBinDetailOutput,
+    dependencies=[Depends(RequiresPermission("process_shipping_jobs"))],
+)
 def remove_item_from_bin(
     id: int,
     bin_id: int,
@@ -665,7 +680,14 @@ def remove_item_from_bin(
         item.shipping_bin_id = None
         item.scanned_for_shipping = False
         session.add(item)
-    
+    session.flush()
+
+    # An emptied bin takes the destination of the next item scanned into it
+    still_holds = session.scalar(select(func.count(Item.id)).where(Item.shipping_bin_id == bin_id)) + \
+        session.scalar(select(func.count(NonTrayItem.id)).where(NonTrayItem.shipping_bin_id == bin_id))
+    if not still_holds:
+        bin_obj.delivery_location_id = None
+
     session.commit()
 
     log_audit_event(
@@ -679,7 +701,8 @@ def remove_item_from_bin(
     )
     session.commit()
 
-    return {"message": "Item removed"}
+    # The updated bin, so the screen's counts and Complete button stay right
+    return _bin_detail(session, bin_id)
 
 @router.patch("/{id}/complete", response_model=ShippingJobOutput, dependencies=[Depends(RequiresPermission("process_shipping_jobs"))])
 def complete_shipping_job(
@@ -704,15 +727,18 @@ def complete_shipping_job(
     # Update Items
     # Get all bin IDs
     bin_ids = [b.id for b in job.bins]
-    
+
+    # (item id, bin id) for everything in the job's bins
+    item_rows = session.execute(
+        select(Item.id, Item.shipping_bin_id).where(Item.shipping_bin_id.in_(bin_ids))
+    ).all() if bin_ids else []
+    non_tray_item_rows = session.execute(
+        select(NonTrayItem.id, NonTrayItem.shipping_bin_id).where(NonTrayItem.shipping_bin_id.in_(bin_ids))
+    ).all() if bin_ids else []
+    if not item_rows and not non_tray_item_rows:
+        raise ValidationException(detail=f"Shipping Job {id} has no items to ship")
+
     if bin_ids:
-        # (item id, bin id) for everything in the job's bins
-        item_rows = session.execute(
-            select(Item.id, Item.shipping_bin_id).where(Item.shipping_bin_id.in_(bin_ids))
-        ).all()
-        non_tray_item_rows = session.execute(
-            select(NonTrayItem.id, NonTrayItem.shipping_bin_id).where(NonTrayItem.shipping_bin_id.in_(bin_ids))
-        ).all()
         item_ids = [item_id for item_id, _ in item_rows]
         non_tray_item_ids = [nt_id for nt_id, _ in non_tray_item_rows]
 
