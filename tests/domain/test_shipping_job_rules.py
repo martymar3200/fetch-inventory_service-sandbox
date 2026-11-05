@@ -688,3 +688,50 @@ def test_bin_scan_that_loses_a_race_gets_a_clear_message(shipper, session, monke
     assert response.json()["detail"] == f"Bin {barcode} is currently active in Job {winner_job}"
     session.expire_all()
     assert session.scalars(select(ShippingBin).where(ShippingBin.shipping_job_id == loser_job)).all() == []
+
+
+# --- Item 13: a change and its audit entry are saved together ---
+
+def _audit_fails(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("audit log unavailable")
+    monkeypatch.setattr("app.routers.shipping_jobs.log_audit_event", broken)
+
+
+def test_item_scan_is_not_saved_without_its_audit_entry(shipper, session, warehouse, monkeypatch):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    _audit_fails(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        _scan_item(shipper, job_id, bin_id, item)
+
+    session.expire_all()
+    assert session.get(Item, item.id).shipping_bin_id is None
+
+
+def test_completion_is_not_saved_without_its_audit_entry(shipper, session, warehouse, monkeypatch):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, item).status_code == 200
+    _audit_fails(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        shipper.patch(f"/shipping-jobs/{job_id}/complete")
+
+    session.expire_all()
+    assert _job(session, job_id).status == ShippingJobStatus.Running
+    assert session.get(Item, item.id).status == ItemStatus.Retrieved
+
+
+def test_new_job_is_not_saved_without_its_audit_entry(shipper, session, monkeypatch):
+    before = session.scalars(select(ShippingJob.id).order_by(ShippingJob.id.desc())).first()
+    _audit_fails(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        shipper.post("/shipping-jobs/", json={})
+
+    session.expire_all()
+    assert session.scalars(select(ShippingJob.id).order_by(ShippingJob.id.desc())).first() == before

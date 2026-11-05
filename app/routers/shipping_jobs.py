@@ -266,8 +266,7 @@ def create_shipping_job(
         new_job.status = ShippingJobStatus.Assigned
         
     session.add(new_job)
-    session.commit()
-    session.refresh(new_job)
+    session.flush()  # gives the job its id for the audit entry
 
     log_audit_event(
         session,
@@ -276,7 +275,9 @@ def create_shipping_job(
         job_type="shipping_jobs",
         job_id=new_job.id,
     )
+    # One commit: the change and its audit entry are saved together or not at all
     session.commit()
+    session.refresh(new_job)
 
     return new_job
 
@@ -333,8 +334,7 @@ def update_shipping_job(
         setattr(job, k, v)
 
     session.add(job)
-    session.commit()
-    session.refresh(job)
+    session.flush()
 
     target_assigned_user = (
         input_data.assigned_user_id
@@ -362,7 +362,6 @@ def update_shipping_job(
                 job_type="shipping_jobs",
                 job_id=id,
             )
-        session.commit()
 
     # Log status change if status was updated
     data = input_data.model_dump(exclude_unset=True)
@@ -375,8 +374,10 @@ def update_shipping_job(
             job_type="shipping_jobs",
             job_id=id,
         )
-        session.commit()
 
+    # One commit: the change and its audit entries are saved together or not at all
+    session.commit()
+    session.refresh(job)
     return job
 
 @router.delete("/{id}", status_code=204, dependencies=[Depends(RequiresPermission("delete_shipping_jobs"))])
@@ -477,7 +478,7 @@ def scan_bin(
     )
     session.add(new_bin)
     try:
-        session.commit()
+        session.flush()
     except IntegrityError:
         # Another scan made this barcode active since the check above
         # (uq_shipping_bins_active_barcode)
@@ -486,7 +487,6 @@ def scan_bin(
         raise ValidationException(
             detail=f"Bin {barcode} is currently active in Job {other.shipping_job_id if other else 'another job'}"
         )
-    session.refresh(new_bin)
 
     log_audit_event(
         session,
@@ -495,6 +495,7 @@ def scan_bin(
         job_type="shipping_jobs",
         job_id=id,
     )
+    # One commit: the bin, any job start, and their audit entries together
     session.commit()
 
     session.refresh(new_bin)
@@ -678,7 +679,6 @@ def scan_item_into_bin(
         non_tray_item.scanned_for_shipping = True
         session.add(non_tray_item)
     session.add(bin_obj)
-    session.commit()
 
     entity_id = item.id if item else non_tray_item.id
     log_audit_event(
@@ -690,6 +690,7 @@ def scan_item_into_bin(
         entity_type="items" if item else "non_tray_items",
         entity_id=entity_id,
     )
+    # One commit: the scan, any job start, and their audit entries together
     session.commit()
 
     # Re-query bin with delivery_location eagerly loaded
@@ -742,8 +743,6 @@ def remove_item_from_bin(
     if not still_holds:
         bin_obj.delivery_location_id = None
 
-    session.commit()
-
     log_audit_event(
         session,
         AuditEventType.ITEM_REMOVED,
@@ -753,6 +752,7 @@ def remove_item_from_bin(
         entity_type="items" if item_type == "item" else "non_tray_items",
         entity_id=item_id,
     )
+    # One commit: the removal and its audit entry together
     session.commit()
 
     # The updated bin, so the screen's counts and Complete button stay right
@@ -854,8 +854,6 @@ def complete_shipping_job(
     job.completed_dt = job.last_transition
 
     session.add(job)
-    session.commit()
-    session.refresh(job)
 
     log_audit_event(
         session,
@@ -864,7 +862,10 @@ def complete_shipping_job(
         job_type="shipping_jobs",
         job_id=id,
     )
+    # One commit: items Out, requests closed, contents kept, empty bins removed,
+    # status, and the audit entries are saved together or not at all
     session.commit()
+    session.refresh(job)
 
     return job_output(job)
 
