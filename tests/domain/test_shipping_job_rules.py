@@ -553,3 +553,21 @@ def test_completing_removes_empty_bins_and_frees_their_barcodes(shipper, session
     assert session.get(ShippingBin, empty_bin) is None
     assert session.get(ShippingBin, used_bin) is not None
     assert _scan_bin(shipper, _new_job(shipper), empty_barcode).status_code == 200
+
+
+# --- Item 10: loading an item doesn't load its shipping bin ---
+
+def test_loading_an_item_does_not_load_its_shipping_bin(shipper, session, warehouse):
+    from sqlalchemy.orm import Session as OrmSession
+    from tests.conftest import engine
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, item).status_code == 200
+
+    with OrmSession(engine) as fresh:
+        loaded = fresh.get(Item, item.id)
+        # as "selectin" this loaded the bin, and with it every item in the bin
+        assert "shipping_bin" not in loaded.__dict__
+        # still there when asked for
+        assert loaded.shipping_bin.id == bin_id

@@ -56,8 +56,10 @@ class ShippingBin(Base):
     
     delivery_location: Mapped[Optional["DeliveryLocation"]] = relationship(lazy="selectin")
     
-    items: Mapped[List["Item"]] = relationship("Item", backref=backref("shipping_bin", lazy="selectin"), foreign_keys="[Item.shipping_bin_id]", lazy="selectin")
-    non_tray_items: Mapped[List["NonTrayItem"]] = relationship("NonTrayItem", backref=backref("shipping_bin", lazy="selectin"), foreign_keys="[NonTrayItem.shipping_bin_id]", lazy="selectin")
+    # The item -> bin side (item.shipping_bin) loads only when read: as "selectin",
+    # loading any item anywhere also loaded its bin and everything in that bin.
+    items: Mapped[List["Item"]] = relationship("Item", backref=backref("shipping_bin", lazy="select"), foreign_keys="[Item.shipping_bin_id]", lazy="selectin")
+    non_tray_items: Mapped[List["NonTrayItem"]] = relationship("NonTrayItem", backref=backref("shipping_bin", lazy="select"), foreign_keys="[NonTrayItem.shipping_bin_id]", lazy="selectin")
     
     cleared_by: Mapped[Optional["User"]] = relationship("User", backref="cleared_shipping_bins", foreign_keys=[cleared_by_id], lazy="selectin")
 
