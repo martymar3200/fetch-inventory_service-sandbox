@@ -63,6 +63,16 @@ def check_shipping_enabled(session: Session):
         raise Forbidden(detail="Shipping module is disabled")
 
 
+def _open_job(session: Session, id: int) -> ShippingJob:
+    """The job, if it can still be scanned into: 404 if missing, 422 if Completed."""
+    job = session.get(ShippingJob, id)
+    if not job:
+        raise NotFound(detail=f"Shipping Job {id} not found")
+    if job.status == ShippingJobStatus.Completed:
+        raise ValidationException(detail=f"Shipping Job {id} is completed")
+    return job
+
+
 def _change_status(job: ShippingJob, new_status: ShippingJobStatus, run_timestamp=None):
     """
     Set a status the way other jobs do: manage_transition adds the Running stretch
@@ -366,10 +376,7 @@ def scan_bin(
     Also handles "auto-clear" logic implicitly if we wanted, but explicit clear is better.
     """
     check_shipping_enabled(session)
-    
-    job = session.get(ShippingJob, id)
-    if not job:
-        raise NotFound(detail=f"Job {id} not found")
+    job = _open_job(session, id)
 
     start_on_scan(session, job, current_user)
 
@@ -431,6 +438,7 @@ def check_item_for_shipping(
     Check item delivery location without assigning to bin.
     """
     check_shipping_enabled(session)
+    _open_job(session, id)
     
     # 1. Resolve Barcode
     barcode_obj = session.execute(
@@ -499,6 +507,7 @@ def scan_item_into_bin(
     Scan an item into a shipping bin.
     """
     check_shipping_enabled(session)
+    _open_job(session, id)
     
     # Get Bin
     bin_obj = session.get(ShippingBin, bin_id)
@@ -629,7 +638,12 @@ def remove_item_from_bin(
     session: Session = Depends(get_session)
 ):
     check_shipping_enabled(session)
-    
+    _open_job(session, id)
+
+    bin_obj = session.get(ShippingBin, bin_id)
+    if not bin_obj or bin_obj.shipping_job_id != id:
+        raise NotFound(detail="Bin not found in this job")
+
     if item_type == "item":
         item = session.get(Item, item_id)
         if not item or item.shipping_bin_id != bin_id:

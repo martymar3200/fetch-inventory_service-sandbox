@@ -372,3 +372,76 @@ def test_empty_bin_in_an_open_job_can_be_cleared(shipper, session):
     # the barcode is free for another job
     other_job = _new_job(shipper)
     assert _scan_bin(shipper, other_job, barcode).status_code == 200
+
+
+# --- Item 5: scans and removals check the job ---
+
+def test_bin_scan_rejected_on_a_completed_job(shipper, session, warehouse):
+    job_id, _, _ = _completed_job(shipper, session, warehouse)
+    barcode = _bin_barcode()
+
+    response = _scan_bin(shipper, job_id, barcode)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"Shipping Job {job_id} is completed"
+    session.expire_all()
+    assert session.scalars(select(ShippingBin).where(ShippingBin.barcode == barcode)).first() is None
+
+
+def test_item_check_rejected_on_a_completed_job(shipper, session, warehouse):
+    job_id, _, _ = _completed_job(shipper, session, warehouse)
+    item = _ready_item(session, warehouse)
+
+    response = shipper.get(f"/shipping-jobs/{job_id}/items/check", params={"barcode": item.barcode.value})
+
+    assert response.status_code == 422
+
+
+def test_item_scan_rejected_on_a_completed_job(shipper, session, warehouse):
+    job_id, bin_id, _ = _completed_job(shipper, session, warehouse)
+    # same destination as the bin, so only the job's status can refuse it
+    location = session.get(DeliveryLocation, session.get(ShippingBin, bin_id).delivery_location_id)
+    item = _ready_item(session, warehouse, location)
+
+    response = _scan_item(shipper, job_id, bin_id, item)
+
+    assert response.status_code == 422
+    session.expire_all()
+    assert session.get(Item, item.id).shipping_bin_id is None
+
+
+def test_remove_rejected_on_a_completed_job(shipper, session, warehouse):
+    job_id, bin_id, item = _completed_job(shipper, session, warehouse)
+
+    response = shipper.delete(f"/shipping-jobs/{job_id}/bins/{bin_id}/items/{item.id}")
+
+    assert response.status_code == 422
+    session.expire_all()
+    assert session.get(Item, item.id).shipping_bin_id == bin_id
+
+
+def test_remove_can_not_reach_another_jobs_bin(shipper, session, warehouse):
+    owner_job = _new_job(shipper)
+    bin_id = _scan_bin(shipper, owner_job).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, owner_job, bin_id, item).status_code == 200
+    other_job = _new_job(shipper)
+
+    response = shipper.delete(f"/shipping-jobs/{other_job}/bins/{bin_id}/items/{item.id}")
+
+    assert response.status_code == 404
+    session.expire_all()
+    assert session.get(Item, item.id).shipping_bin_id == bin_id
+
+
+def test_remove_from_an_open_job_still_works(shipper, session, warehouse):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, item).status_code == 200
+
+    response = shipper.delete(f"/shipping-jobs/{job_id}/bins/{bin_id}/items/{item.id}")
+
+    assert response.status_code == 200, response.text
+    session.expire_all()
+    assert session.get(Item, item.id).shipping_bin_id is None
