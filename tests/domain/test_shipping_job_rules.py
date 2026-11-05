@@ -534,3 +534,22 @@ def test_job_with_no_items_can_not_complete(shipper, session):
     assert response.status_code == 422
     assert response.json()["detail"] == f"Shipping Job {job_id} has no items to ship"
     assert _job(session, job_id).status == ShippingJobStatus.Running
+
+
+# --- Item 12: completing removes bins that were never filled ---
+
+def test_completing_removes_empty_bins_and_frees_their_barcodes(shipper, session, warehouse):
+    job_id = _new_job(shipper)
+    used_bin = _scan_bin(shipper, job_id).json()["id"]
+    empty_barcode = _bin_barcode()
+    empty_bin = _scan_bin(shipper, job_id, empty_barcode).json()["id"]
+    assert _scan_item(shipper, job_id, used_bin, _ready_item(session, warehouse)).status_code == 200
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}/complete")
+
+    assert response.status_code == 200, response.text
+    assert [b["id"] for b in response.json()["bins"]] == [used_bin]
+    session.expire_all()
+    assert session.get(ShippingBin, empty_bin) is None
+    assert session.get(ShippingBin, used_bin) is not None
+    assert _scan_bin(shipper, _new_job(shipper), empty_barcode).status_code == 200

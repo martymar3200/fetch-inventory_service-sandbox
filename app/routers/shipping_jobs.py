@@ -738,6 +738,19 @@ def complete_shipping_job(
     if not item_rows and not non_tray_item_rows:
         raise ValidationException(detail=f"Shipping Job {id} has no items to ship")
 
+    # Bins scanned but never filled (e.g. scanned, then not used) didn't ship.
+    # Remove them so their barcodes aren't held by a finished job.
+    used_bin_ids = {bin_id for _, bin_id in item_rows} | {bin_id for _, bin_id in non_tray_item_rows}
+    for empty_bin in [b for b in job.bins if b.id not in used_bin_ids]:
+        log_audit_event(
+            session,
+            AuditEventType.BIN_CLEARED,
+            f"Empty bin {empty_bin.barcode} removed from Shipping Job {id} on completion",
+            job_type="shipping_jobs",
+            job_id=id,
+        )
+        session.delete(empty_bin)
+
     if bin_ids:
         item_ids = [item_id for item_id, _ in item_rows]
         non_tray_item_ids = [nt_id for nt_id, _ in non_tray_item_rows]
