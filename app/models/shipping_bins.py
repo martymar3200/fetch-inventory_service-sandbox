@@ -61,6 +61,15 @@ class ShippingBin(Base):
     
     cleared_by: Mapped[Optional["User"]] = relationship("User", backref="cleared_shipping_bins", foreign_keys=[cleared_by_id], lazy="selectin")
 
+    # What the bin held when its job was completed (shipping_bin_contents).
+    # Read-only; loaded only when a route asks for it.
+    shipped_items: Mapped[List["Item"]] = relationship(
+        "Item", secondary="shipping_bin_contents", viewonly=True, order_by="Item.id"
+    )
+    shipped_non_tray_items: Mapped[List["NonTrayItem"]] = relationship(
+        "NonTrayItem", secondary="shipping_bin_contents", viewonly=True, order_by="NonTrayItem.id"
+    )
+
     # Composite Index for Auto-Clear Logic
     __table_args__ = (
         Index("idx_shipping_bin_barcode_uncleared", "barcode", "cleared_dt"),

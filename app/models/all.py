@@ -41,6 +41,7 @@ from app.models.shelves import Shelf
 from app.models.shelving_job_containers import ShelvingJobContainer
 from app.models.shelving_job_discrepancies import ShelvingJobDiscrepancy
 from app.models.shelving_jobs import ShelvingJob
+from app.models.shipping_bin_contents import ShippingBinContent
 from app.models.shipping_bins import ShippingBin
 from app.models.shipping_jobs import ShippingJob
 from app.models.side_orientations import SideOrientation

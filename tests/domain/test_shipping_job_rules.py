@@ -240,3 +240,135 @@ def test_completed_job_can_not_be_changed(shipper, session, warehouse, body):
     job = _job(session, job_id)
     assert job.status == ShippingJobStatus.Completed
     assert job.assigned_user_id == assigned_before
+
+
+# --- Item 4: a completed job keeps its bin contents; open bins can't be cleared ---
+
+def _manifest_barcodes(client, job_id, path="manifest"):
+    response = client.get(f"/shipping-jobs/{job_id}/{path}" if path else f"/shipping-jobs/{job_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    return [
+        (b["barcode"], [i["barcode"]["value"] for i in b["items"]], b["item_count"])
+        for b in body["bins"]
+    ], body["total_items"]
+
+
+def _bin_barcode_of(session, bin_id):
+    return session.get(ShippingBin, bin_id).barcode
+
+
+@pytest.mark.parametrize("path", ["manifest", None])
+def test_manifest_keeps_items_after_the_bin_is_cleared(shipper, session, warehouse, path):
+    job_id, bin_id, item = _completed_job(shipper, session, warehouse)
+    expected = ([(_bin_barcode_of(session, bin_id), [item.barcode.value], 1)], 1)
+
+    response = shipper.post("/shipping-jobs/bins/clear", params={"barcode": _bin_barcode_of(session, bin_id)})
+
+    assert response.status_code == 200, response.text
+    session.expire_all()
+    assert session.get(ShippingBin, bin_id).cleared_dt is not None
+    assert session.get(Item, item.id).shipping_bin_id == bin_id
+    assert _manifest_barcodes(shipper, job_id, path) == expected
+
+
+def test_manifest_keeps_items_after_they_are_refiled(shipper, session, warehouse):
+    job_id, bin_id, item = _completed_job(shipper, session, warehouse)
+    # what a refile scan does to the item (refile_jobs.py)
+    record = session.get(Item, item.id)
+    record.status = ItemStatus.In
+    record.shipping_bin_id = None
+    session.commit()
+
+    bins, total = _manifest_barcodes(shipper, job_id)
+
+    assert bins == [(_bin_barcode_of(session, bin_id), [item.barcode.value], 1)]
+    assert total == 1
+
+
+def test_manifest_keeps_items_that_ship_again(shipper, session, warehouse):
+    first_job, first_bin, item = _completed_job(shipper, session, warehouse)
+    assert shipper.post(
+        "/shipping-jobs/bins/clear", params={"barcode": _bin_barcode_of(session, first_bin)}
+    ).status_code == 200
+    # requested and retrieved again
+    _ready_item_again = session.get(Item, item.id)
+    _ready_item_again.status = ItemStatus.Retrieved
+    session.add(Request(
+        item_id=item.id,
+        delivery_location_id=_location(session).id,
+        status=RequestStatus.Retrieved,
+        external_request_id=uuid.uuid4().hex[:12],
+    ))
+    session.commit()
+
+    second_job = _new_job(shipper)
+    second_bin = _scan_bin(shipper, second_job).json()["id"]
+    assert _scan_item(shipper, second_job, second_bin, item).status_code == 200
+
+    first_bins, _ = _manifest_barcodes(shipper, first_job)
+    second_bins, _ = _manifest_barcodes(shipper, second_job)
+    assert first_bins[0][1] == [item.barcode.value]
+    assert second_bins[0][1] == [item.barcode.value]
+
+
+def test_completing_records_tray_and_non_tray_items(shipper, session, warehouse):
+    location = _location(session)
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    tray_item = _ready_item(session, warehouse, location)
+    non_tray = warehouse.non_tray()
+    from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
+    record = session.get(NonTrayItem, non_tray.id)
+    record.status = NonTrayItemStatus.Retrieved
+    session.add(Request(
+        non_tray_item_id=non_tray.id,
+        delivery_location_id=location.id,
+        status=RequestStatus.Retrieved,
+        external_request_id=uuid.uuid4().hex[:12],
+    ))
+    session.commit()
+    assert _scan_item(shipper, job_id, bin_id, tray_item).status_code == 200
+    assert _scan_item(shipper, job_id, bin_id, record).status_code == 200
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}/complete")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total_items"] == 2
+    assert [i["id"] for i in body["bins"][0]["non_tray_items"]] == [non_tray.id]
+    from app.models.shipping_bin_contents import ShippingBinContent
+    session.expire_all()
+    rows = session.scalars(select(ShippingBinContent).where(ShippingBinContent.shipping_bin_id == bin_id)).all()
+    assert {(r.item_id, r.non_tray_item_id) for r in rows} == {(tray_item.id, None), (None, non_tray.id)}
+
+
+def test_bin_with_items_in_an_open_job_can_not_be_cleared(shipper, session, warehouse):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, item).status_code == 200
+    barcode = _bin_barcode_of(session, bin_id)
+
+    response = shipper.post("/shipping-jobs/bins/clear", params={"barcode": barcode})
+
+    assert response.status_code == 422
+    assert f"open Shipping Job {job_id}" in response.json()["detail"]
+    session.expire_all()
+    assert session.get(ShippingBin, bin_id).cleared_dt is None
+    assert session.get(Item, item.id).shipping_bin_id == bin_id
+
+
+def test_empty_bin_in_an_open_job_can_be_cleared(shipper, session):
+    job_id = _new_job(shipper)
+    barcode = _bin_barcode()
+    bin_id = _scan_bin(shipper, job_id, barcode).json()["id"]
+
+    response = shipper.post("/shipping-jobs/bins/clear", params={"barcode": barcode})
+
+    assert response.status_code == 200, response.text
+    session.expire_all()
+    assert session.get(ShippingBin, bin_id) is None
+    # the barcode is free for another job
+    other_job = _new_job(shipper)
+    assert _scan_bin(shipper, other_job, barcode).status_code == 200

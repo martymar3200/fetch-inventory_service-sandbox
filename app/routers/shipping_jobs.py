@@ -18,6 +18,7 @@ from app.filter_params import SortParams, JobFilterParams
 from app.models.users import User
 from app.models.shipping_jobs import ShippingJob, ShippingJobStatus
 from app.models.shipping_bins import ShippingBin, ShippingBinStatus
+from app.models.shipping_bin_contents import ShippingBinContent
 from app.models.items import Item, ItemStatus
 from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
 from app.models.delivery_locations import DeliveryLocation
@@ -30,7 +31,9 @@ from app.schemas.shipping_jobs import (
     ShippingJobOutput,
     ShippingJobOutput,
     ShippingBinDetailOutput,
-    ShippingItemCheckOutput
+    ShippingItemCheckOutput,
+    ItemNestedForShipping,
+    NonTrayItemNestedForShipping,
 )
 
 from app.auth.dependencies import RequiresPermission, get_current_user_with_permissions
@@ -67,6 +70,37 @@ def _change_status(job: ShippingJob, new_status: ShippingJobStatus, run_timestam
     """
     manage_transition(job, SimpleNamespace(status=new_status, run_timestamp=run_timestamp))
     job.status = new_status
+
+
+def _bins_with_contents():
+    """Load options for a job's bins with their current and shipped contents."""
+    bins = selectinload(ShippingJob.bins)
+    return [
+        bins.selectinload(ShippingBin.items).selectinload(Item.barcode),
+        bins.selectinload(ShippingBin.non_tray_items).selectinload(NonTrayItem.barcode),
+        bins.selectinload(ShippingBin.shipped_items).selectinload(Item.barcode),
+        bins.selectinload(ShippingBin.shipped_non_tray_items).selectinload(NonTrayItem.barcode),
+        bins.selectinload(ShippingBin.delivery_location),
+    ]
+
+
+def job_output(job: ShippingJob) -> ShippingJobOutput:
+    """
+    A Completed job shows what its bins held when it was completed
+    (shipping_bin_contents). Clearing a bin, refiling an item or shipping it again
+    changes the item's live bin link, but not this. An open job shows its bins now.
+    """
+    output = ShippingJobOutput.model_validate(job, from_attributes=True)
+    if job.status == ShippingJobStatus.Completed:
+        for bin_output, bin_record in zip(output.bins, job.bins):
+            bin_output.items = [
+                ItemNestedForShipping.model_validate(i, from_attributes=True) for i in bin_record.shipped_items
+            ]
+            bin_output.non_tray_items = [
+                NonTrayItemNestedForShipping.model_validate(i, from_attributes=True)
+                for i in bin_record.shipped_non_tray_items
+            ]
+    return output
 
 
 def start_on_scan(session: Session, job: ShippingJob, current_user: User):
@@ -173,15 +207,13 @@ def get_shipping_job_detail(
     session: Session = Depends(get_session)
 ):
     query = select(ShippingJob).where(ShippingJob.id == id).options(
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.items).selectinload(Item.barcode),
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.non_tray_items).selectinload(NonTrayItem.barcode),
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.delivery_location),
+        *_bins_with_contents(),
         selectinload(ShippingJob.assigned_user)
     )
     job = session.execute(query).scalars().first()
     if not job:
         raise NotFound(detail=f"Shipping Job {id} not found")
-    return job
+    return job_output(job)
 
 @router.patch("/{id}", response_model=ShippingJobOutput, dependencies=[Depends(RequiresPermission("process_shipping_jobs"))])
 def update_shipping_job(
@@ -653,18 +685,24 @@ def complete_shipping_job(
     bin_ids = [b.id for b in job.bins]
     
     if bin_ids:
-        # Get Item IDs
-        item_ids = [
-            item_id for (item_id,) in session.execute(
-                select(Item.id).where(Item.shipping_bin_id.in_(bin_ids))
-            ).all()
-        ]
-        # Get Non-Tray Item IDs
-        non_tray_item_ids = [
-            nt_id for (nt_id,) in session.execute(
-                select(NonTrayItem.id).where(NonTrayItem.shipping_bin_id.in_(bin_ids))
-            ).all()
-        ]
+        # (item id, bin id) for everything in the job's bins
+        item_rows = session.execute(
+            select(Item.id, Item.shipping_bin_id).where(Item.shipping_bin_id.in_(bin_ids))
+        ).all()
+        non_tray_item_rows = session.execute(
+            select(NonTrayItem.id, NonTrayItem.shipping_bin_id).where(NonTrayItem.shipping_bin_id.in_(bin_ids))
+        ).all()
+        item_ids = [item_id for item_id, _ in item_rows]
+        non_tray_item_ids = [nt_id for nt_id, _ in non_tray_item_rows]
+
+        # Keep what each bin shipped, for the manifest (the item links change later)
+        session.add_all(
+            [ShippingBinContent(shipping_bin_id=bin_id, item_id=item_id) for item_id, bin_id in item_rows]
+            + [
+                ShippingBinContent(shipping_bin_id=bin_id, non_tray_item_id=nt_id)
+                for nt_id, bin_id in non_tray_item_rows
+            ]
+        )
 
         # Update Items
         if item_ids:
@@ -714,7 +752,7 @@ def complete_shipping_job(
     )
     session.commit()
 
-    return job
+    return job_output(job)
 
 @router.post("/bins/clear", dependencies=[Depends(RequiresPermission("process_shipping_jobs"))])
 def clear_bin(
@@ -723,37 +761,47 @@ def clear_bin(
     current_user: User = Depends(get_current_user_with_permissions)
 ):
     """
-    Mark a bin as "Cleared" (emptied/returned).
-    Finds the most recent Open/Closed bin with this barcode.
+    Mark a bin as "Cleared" (emptied/returned) so its barcode can be used again.
+    Finds the most recent uncleared bin with this barcode.
+
+    - Bin in a Completed job: stamped cleared. Its items keep their link to it, and
+      the manifest reads shipping_bin_contents, so nothing about the shipment changes.
+    - Empty bin in an open job (e.g. the wrong bin was scanned): removed from the job.
+    - Bin with items in an open job: refused; clearing it would drop the items
+      from the job without a trace.
     """
+    check_shipping_enabled(session)
+
     bin_obj = session.execute(
         select(ShippingBin)
         .where(ShippingBin.barcode == barcode)
         .where(ShippingBin.cleared_dt.is_(None))
         .order_by(ShippingBin.create_dt.desc())
     ).scalars().first()
-    
+
     if not bin_obj:
         raise NotFound(detail="Active bin not found")
 
-    # Clear item associations
-    session.execute(
-        update(Item)
-        .where(Item.shipping_bin_id == bin_obj.id)
-        .values(shipping_bin_id=None, scanned_for_shipping=False)
-    )
-    session.execute(
-        update(NonTrayItem)
-        .where(NonTrayItem.shipping_bin_id == bin_obj.id)
-        .values(shipping_bin_id=None, scanned_for_shipping=False)
-    )
-        
+    job = session.get(ShippingJob, bin_obj.shipping_job_id)
+    if job.status != ShippingJobStatus.Completed:
+        if bin_obj.items or bin_obj.non_tray_items:
+            raise ValidationException(
+                detail=f"Bin {barcode} is in open Shipping Job {job.id}. "
+                "Complete the job or remove its items first."
+            )
+        log_audit_event(
+            session,
+            AuditEventType.BIN_CLEARED,
+            f"Empty bin {barcode} cleared and removed from Shipping Job {job.id}",
+            job_type="shipping_jobs",
+            job_id=job.id,
+        )
+        session.delete(bin_obj)
+        session.commit()
+        return {"message": f"Bin {barcode} cleared"}
+
     bin_obj.cleared_dt = datetime.now(timezone.utc)
     bin_obj.cleared_by_id = current_user.id
-    
-    session.add(bin_obj)
-    session.commit()
-
     log_audit_event(
         session,
         AuditEventType.BIN_CLEARED,
@@ -776,24 +824,18 @@ def get_shipping_manifest(
     Get manifest data. optimized for printing.
     """
     check_shipping_enabled(session)
-    
-    job = session.get(ShippingJob, id)
+
+    # Load Bins and Items and Locations for printing
+    query = select(ShippingJob).where(ShippingJob.id == id).options(*_bins_with_contents())
+    job = session.execute(query).scalars().first()
     if not job:
         raise NotFound(detail="Job not found")
 
-    # Load Bins and Items and Locations for printing
-    query = select(ShippingJob).where(ShippingJob.id == id).options(
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.items).selectinload(Item.barcode),
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.non_tray_items).selectinload(NonTrayItem.barcode),
-        selectinload(ShippingJob.bins).selectinload(ShippingBin.delivery_location)
-    )
-    
-    job = session.execute(query).scalars().first()
-    
-    # Filter in memory if needed
+    # Filter the response, not job.bins: that relationship deletes orphaned bins
+    output = job_output(job)
     if scope == "bin" and filter_id:
-        job.bins = [b for b in job.bins if b.id == filter_id]
+        output.bins = [b for b in output.bins if b.id == filter_id]
     elif scope == "location" and filter_id:
-         job.bins = [b for b in job.bins if b.delivery_location_id == filter_id]
-         
-    return job
+        output.bins = [b for b in output.bins if b.delivery_location_id == filter_id]
+
+    return output
