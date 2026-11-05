@@ -198,7 +198,10 @@ def update_shipping_job(
     job = session.get(ShippingJob, id)
     if not job:
         raise NotFound(detail=f"Shipping Job {id} not found")
-        
+
+    if job.status == ShippingJobStatus.Completed:
+        raise ValidationException(detail="Completed shipping jobs can't be changed")
+
     original_status = job.status
     original_assigned_user_id = job.assigned_user_id
     

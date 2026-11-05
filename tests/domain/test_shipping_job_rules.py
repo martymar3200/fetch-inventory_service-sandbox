@@ -201,3 +201,42 @@ def test_completing_adds_the_running_time(shipper, session, warehouse):
     job = _job(session, job_id)
     assert timedelta(minutes=19) < job.run_time < timedelta(minutes=21)
     assert job.completed_dt == job.last_transition
+
+
+# --- Item 3: PATCH can't complete a job or change a completed one ---
+
+def _completed_job(client, session, warehouse):
+    job_id = _new_job(client)
+    bin_id = _scan_bin(client, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(client, job_id, bin_id, item).status_code == 200
+    assert client.patch(f"/shipping-jobs/{job_id}/complete").status_code == 200
+    return job_id, bin_id, item
+
+
+def test_patch_can_not_complete_a_job(shipper, session, warehouse):
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    item = _ready_item(session, warehouse)
+    assert _scan_item(shipper, job_id, bin_id, item).status_code == 200
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}", json={"status": "Completed"})
+
+    assert response.status_code == 422
+    assert _job(session, job_id).status == ShippingJobStatus.Running
+    session.expire_all()
+    assert session.get(Item, item.id).status == ItemStatus.Retrieved
+
+
+@pytest.mark.parametrize("body", [{"status": "Running"}, {"status": "Paused"}, {"assigned_user_id": None}])
+def test_completed_job_can_not_be_changed(shipper, session, warehouse, body):
+    job_id, _, _ = _completed_job(shipper, session, warehouse)
+    before = _job(session, job_id)
+    assigned_before = before.assigned_user_id
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}", json=body)
+
+    assert response.status_code == 422
+    job = _job(session, job_id)
+    assert job.status == ShippingJobStatus.Completed
+    assert job.assigned_user_id == assigned_before

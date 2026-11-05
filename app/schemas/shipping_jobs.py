@@ -75,6 +75,9 @@ class ShippingJobUpdateInput(BaseModel):
     def validate_status(cls, v):
         if v and v not in ShippingJobStatus._member_names_:
              raise ValueError(f"Invalid status: {v}")
+        # Completing sends items Out and closes their requests; only /complete does that
+        if v == ShippingJobStatus.Completed.value:
+            raise ValueError("Use the Complete action to finish a shipping job")
         return v
 
 class ShippingJobOutput(BaseModel):
