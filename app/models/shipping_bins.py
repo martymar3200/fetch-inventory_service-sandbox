@@ -85,5 +85,6 @@ class ShippingBin(Base):
 
     @property
     def item_count(self) -> int:
-        return len(self.items) if self.items is not None else 0
+        """Tray and non-tray items in the bin (the active-bins report reads this)."""
+        return len(self.items or []) + len(self.non_tray_items or [])
 

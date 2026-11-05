@@ -2568,7 +2568,7 @@ def get_shipping_bins_csv(
                 row.barcode if row.barcode else "",
                 row.shipping_job_id,
                 row.shipping_job.create_dt,
-                len(row.items),
+                row.item_count,  # tray and non-tray items
                 row.delivery_location.name if row.delivery_location else "",
             ]
         )

@@ -34,6 +34,7 @@ def shipper(client, test_database, uploader, monkeypatch):
             P("create_shipping_jobs"),
             P("process_shipping_jobs"),
             P("delete_shipping_jobs"),
+            P("can_access_reports"),
         ]
 
     class MockUser:
@@ -747,3 +748,34 @@ def test_status_change_is_logged_with_plain_status_names(shipper, session):
 
     assert response.status_code == 200, response.text
     assert _events(session, job_id, "status_changed") == ["Status changed from Running to Paused"]
+
+
+# --- Active-bins report counts non-tray items too ---
+
+def test_active_bins_report_counts_tray_and_non_tray_items(shipper, session, warehouse):
+    from app.models.non_tray_items import NonTrayItem, NonTrayItemStatus
+    location = _location(session)
+    job_id = _new_job(shipper)
+    barcode = _bin_barcode()
+    bin_id = _scan_bin(shipper, job_id, barcode).json()["id"]
+    assert _scan_item(shipper, job_id, bin_id, _ready_item(session, warehouse, location)).status_code == 200
+    non_tray = session.get(NonTrayItem, warehouse.non_tray().id)
+    non_tray.status = NonTrayItemStatus.Retrieved
+    session.add(Request(
+        non_tray_item_id=non_tray.id,
+        delivery_location_id=location.id,
+        status=RequestStatus.Retrieved,
+        external_request_id=uuid.uuid4().hex[:12],
+    ))
+    session.commit()
+    assert _scan_item(shipper, job_id, bin_id, non_tray).status_code == 200
+
+    report = shipper.get("/reporting/shipping-bins/", params={"size": 100})
+    csv_file = shipper.get("/reporting/shipping-bins/download")
+
+    assert report.status_code == 200, report.text
+    [row] = [r for r in report.json()["items"] if r["barcode"] == barcode]
+    assert row["item_count"] == 2
+    assert csv_file.status_code == 200, csv_file.text
+    [line] = [l for l in csv_file.text.splitlines() if l.startswith(barcode)]
+    assert line.split(",")[3] == "2"
