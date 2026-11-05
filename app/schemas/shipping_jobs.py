@@ -67,6 +67,8 @@ class ShippingJobInput(BaseModel):
 class ShippingJobUpdateInput(BaseModel):
     status: Optional[str] = None
     assigned_user_id: Optional[int] = None
+    # Device time of the status change, used for run time (as on pick lists)
+    run_timestamp: Optional[datetime] = None
 
     @field_validator("status", mode="before")
     @classmethod

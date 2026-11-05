@@ -2,6 +2,7 @@
 # /app/routers/shipping_jobs.py
 
 from typing import Optional, List
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
@@ -35,6 +36,7 @@ from app.schemas.shipping_jobs import (
 from app.auth.dependencies import RequiresPermission, get_current_user_with_permissions
 from app.helpers.system_setting_helpers import get_setting_value
 from app.utils.job_assignment import auto_assign_on_start, update_status_on_assignment
+from app.utilities import manage_transition
 from app.services.audit_service import log_audit_event, AuditEventType
 from app.config.exceptions import (
     NotFound,
@@ -56,6 +58,46 @@ def check_shipping_enabled(session: Session):
     enabled = get_setting_value(session, "shipping_module_enabled", "false")
     if enabled.lower() != "true":
         raise Forbidden(detail="Shipping module is disabled")
+
+
+def _change_status(job: ShippingJob, new_status: ShippingJobStatus, run_timestamp=None):
+    """
+    Set a status the way other jobs do: manage_transition adds the Running stretch
+    that just ended to run_time and starts a new one in last_transition.
+    """
+    manage_transition(job, SimpleNamespace(status=new_status, run_timestamp=run_timestamp))
+    job.status = new_status
+
+
+def start_on_scan(session: Session, job: ShippingJob, current_user: User):
+    """
+    The first bin or item scan starts the job: Created or Assigned becomes Running,
+    and an unassigned job goes to the person scanning (auto_assign_on_start).
+    Adds the audit entries to the session; the caller commits them with the scan.
+    """
+    if job.status not in (ShippingJobStatus.Created, ShippingJobStatus.Assigned):
+        return
+
+    original_status = ShippingJobStatus(job.status)
+    was_assigned = job.assigned_user_id is not None
+    auto_assign_on_start(job, ShippingJobStatus.Running, current_user.id)
+    _change_status(job, ShippingJobStatus.Running)
+
+    if not was_assigned and job.assigned_user_id is not None:
+        log_audit_event(
+            session,
+            AuditEventType.JOB_ASSIGNED,
+            f"Shipping Job {job.id} assigned to {current_user.first_name} {current_user.last_name}",
+            job_type="shipping_jobs",
+            job_id=job.id,
+        )
+    log_audit_event(
+        session,
+        AuditEventType.JOB_STATUS_CHANGED,
+        f"Status changed from {original_status.value} to {ShippingJobStatus.Running.value}",
+        job_type="shipping_jobs",
+        job_id=job.id,
+    )
 
 @router.get("/", response_model=Page[ShippingJobListOutput])
 def get_shipping_job_list(
@@ -167,15 +209,15 @@ def update_shipping_job(
     if input_data.assigned_user_id is not None and not input_data.status:
         update_status_on_assignment(job, input_data.assigned_user_id, original_status)
 
+    # Run time: add the Running stretch that just ended, start a new one
+    if input_data.status:
+        manage_transition(job, input_data)
+
     # Apply updates
-    data = input_data.model_dump(exclude_unset=True)
+    data = input_data.model_dump(exclude_unset=True, exclude={"run_timestamp"})
     for k, v in data.items():
         setattr(job, k, v)
-        
-    # Track transition
-    if input_data.status and input_data.status != original_status:
-        job.last_transition = datetime.now(timezone.utc)
-        
+
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -293,7 +335,9 @@ def scan_bin(
     job = session.get(ShippingJob, id)
     if not job:
         raise NotFound(detail=f"Job {id} not found")
-        
+
+    start_on_scan(session, job, current_user)
+
     # Check if bin exists in this job
     existing_bin = session.execute(
         select(ShippingBin).where(
@@ -301,8 +345,10 @@ def scan_bin(
             ShippingBin.barcode == barcode
         )
     ).scalars().first()
-    
+
     if existing_bin:
+        session.commit()  # saves the job start, if this scan started it
+        session.refresh(existing_bin)
         return existing_bin
         
     # Check if this bin barcode is used elsewhere and Uncleared?
@@ -411,7 +457,8 @@ def scan_item_into_bin(
     id: int,
     bin_id: int,
     item_barcode: str,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user_with_permissions),
 ):
     """
     Scan an item into a shipping bin.
@@ -502,7 +549,9 @@ def scan_item_into_bin(
     else:
         if item_loc_id:
             bin_obj.delivery_location_id = item_loc_id
-            
+
+    start_on_scan(session, bin_obj.shipping_job, current_user)
+
     # Add Item to Bin
     if item:
         item.shipping_bin_id = bin_obj.id
@@ -646,10 +695,9 @@ def complete_shipping_job(
                 .values(status=RequestStatus.Completed, fulfilled=True, update_dt=datetime.now(timezone.utc))
             )
         
-    job.status = ShippingJobStatus.Completed
-    job.completed_dt = datetime.now(timezone.utc)
-    job.last_transition = datetime.now(timezone.utc)
-    
+    _change_status(job, ShippingJobStatus.Completed)
+    job.completed_dt = job.last_transition
+
     session.add(job)
     session.commit()
     session.refresh(job)
