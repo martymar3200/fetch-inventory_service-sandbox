@@ -445,3 +445,46 @@ def test_remove_from_an_open_job_still_works(shipper, session, warehouse):
     assert response.status_code == 200, response.text
     session.expire_all()
     assert session.get(Item, item.id).shipping_bin_id is None
+
+
+# --- Item 6: the job list sorts and filters by what the dashboard sends ---
+
+def _list_ids(client, **params):
+    response = client.get("/shipping-jobs/", params={"size": 100, **params})
+    assert response.status_code == 200, response.text
+    return [job["id"] for job in response.json()["items"]]
+
+
+def test_list_sorts_by_the_column_asked_for(shipper, session):
+    ids = [_new_job(shipper) for _ in range(3)]
+
+    ascending = [i for i in _list_ids(shipper, sort_by="id", sort_order="asc") if i in ids]
+    descending = [i for i in _list_ids(shipper, sort_by="id", sort_order="desc") if i in ids]
+
+    assert ascending == sorted(ids)
+    assert descending == sorted(ids, reverse=True)
+
+
+def test_list_rejects_an_unknown_sort_column(shipper):
+    response = shipper.get("/shipping-jobs/", params={"sort_by": "nonsense"})
+
+    assert response.status_code == 400
+
+
+def test_list_default_order_is_newest_first(shipper, session):
+    ids = [_new_job(shipper) for _ in range(3)]
+    # same create_dt, so only the tie-breaker orders them
+    now = datetime.now(timezone.utc)
+    for job_id in ids:
+        session.get(ShippingJob, job_id).create_dt = now
+    session.commit()
+
+    listed = [i for i in _list_ids(shipper) if i in ids]
+
+    assert listed == sorted(ids, reverse=True)
+
+
+def test_list_finds_a_job_by_number(shipper):
+    ids = [_new_job(shipper) for _ in range(2)]
+
+    assert _list_ids(shipper, workflow_id=ids[1]) == [ids[1]]

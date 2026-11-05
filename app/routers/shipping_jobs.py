@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.database.session import get_session
 from app.filter_params import SortParams, JobFilterParams
+from app.sorting import BaseSorter
 from app.models.users import User
 from app.models.shipping_jobs import ShippingJob, ShippingJobStatus
 from app.models.shipping_bins import ShippingBin, ShippingBinStatus
@@ -169,11 +170,17 @@ def get_shipping_job_list(
     
     if params.status:
          query = query.where(ShippingJob.status.in_(params.status))
-         
-    # Default sort by create_dt desc if not specified
-    if not sort_params.sort_by:
+    # Job # search, as on the other job lists
+    if params.workflow_id:
+        query = query.where(ShippingJob.id == params.workflow_id)
+
+    if sort_params.sort_by:
+        query = BaseSorter(ShippingJob).apply_sorting(query, sort_params)
+    else:
         query = query.order_by(ShippingJob.create_dt.desc())
-        
+    # Tie-breaker so pages never repeat or skip a job
+    query = query.order_by(ShippingJob.id.desc())
+
     return paginate(session, query)
 
 @router.post("/", response_model=ShippingJobOutput, status_code=201, dependencies=[Depends(RequiresPermission("create_shipping_jobs"))])
