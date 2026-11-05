@@ -171,6 +171,7 @@ def get_shipping_job_list(
     """
     List shipping jobs with pagination and filtering.
     """
+    check_shipping_enabled(session)
     query = select(ShippingJob).options(
         selectinload(ShippingJob.assigned_user),
         selectinload(ShippingJob.created_by),
@@ -286,6 +287,7 @@ def get_shipping_job_detail(
     id: int, 
     session: Session = Depends(get_session)
 ):
+    check_shipping_enabled(session)
     query = select(ShippingJob).where(ShippingJob.id == id).options(
         *_bins_with_contents(),
         selectinload(ShippingJob.assigned_user)

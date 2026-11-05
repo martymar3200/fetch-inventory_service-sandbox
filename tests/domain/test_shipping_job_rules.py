@@ -779,3 +779,16 @@ def test_active_bins_report_counts_tray_and_non_tray_items(shipper, session, war
     assert csv_file.status_code == 200, csv_file.text
     [line] = [l for l in csv_file.text.splitlines() if l.startswith(barcode)]
     assert line.split(",")[3] == "2"
+
+
+# --- Every shipping route is closed while the module is off ---
+
+@pytest.mark.parametrize("path", ["/shipping-jobs/", "/shipping-jobs/{id}"])
+def test_list_and_detail_are_closed_while_the_module_is_off(shipper, monkeypatch, path):
+    job_id = _new_job(shipper)
+    monkeypatch.setattr("app.routers.shipping_jobs.get_setting_value", lambda *args, **kwargs: "false")
+
+    response = shipper.get(path.format(id=job_id))
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Shipping module is disabled"
