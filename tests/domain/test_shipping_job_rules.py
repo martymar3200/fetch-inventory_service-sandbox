@@ -735,3 +735,15 @@ def test_new_job_is_not_saved_without_its_audit_entry(shipper, session, monkeypa
 
     session.expire_all()
     assert session.scalars(select(ShippingJob.id).order_by(ShippingJob.id.desc())).first() == before
+
+
+# --- Audit text for a PATCH status change ---
+
+def test_status_change_is_logged_with_plain_status_names(shipper, session):
+    job_id = _new_job(shipper)
+    _running_for(session, job_id, 1)
+
+    response = shipper.patch(f"/shipping-jobs/{job_id}", json={"status": "Paused"})
+
+    assert response.status_code == 200, response.text
+    assert _events(session, job_id, "status_changed") == ["Status changed from Running to Paused"]

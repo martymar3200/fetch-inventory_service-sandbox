@@ -370,7 +370,8 @@ def update_shipping_job(
         log_audit_event(
             session,
             AuditEventType.JOB_STATUS_CHANGED,
-            f"Status changed from {original_status} to {new_status_val}",
+            # .value: f-strings print a str Enum as "ShippingJobStatus.Running"
+            f"Status changed from {ShippingJobStatus(original_status).value} to {new_status_val}",
             job_type="shipping_jobs",
             job_id=id,
         )
