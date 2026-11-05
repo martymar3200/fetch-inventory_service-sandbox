@@ -95,6 +95,13 @@ def _bins_with_contents():
     ]
 
 
+def _active_bin(session: Session, barcode: str) -> Optional[ShippingBin]:
+    """The uncleared bin with this barcode, in any job."""
+    return session.execute(
+        select(ShippingBin).where(ShippingBin.barcode == barcode, ShippingBin.cleared_dt.is_(None))
+    ).scalars().first()
+
+
 def _bin_detail(session: Session, bin_id: int) -> ShippingBin:
     """A bin with its items, barcodes and destination, as the scan screen shows it."""
     return session.execute(
@@ -458,13 +465,7 @@ def scan_bin(
     # Check if this bin barcode is used elsewhere and Uncleared?
     # Logic: "shipping bins are reusable". If it's used in an old job, is it cleared?
     # New requirement: check for UNCLEARED bins with same barcode
-    uncleared = session.execute(
-        select(ShippingBin).where(
-            ShippingBin.barcode == barcode,
-            ShippingBin.cleared_dt.is_(None)
-        )
-    ).scalars().first()
-    
+    uncleared = _active_bin(session, barcode)
     if uncleared:
         raise ValidationException(detail=f"Bin {barcode} is currently active in Job {uncleared.shipping_job_id}")
 
@@ -475,7 +476,16 @@ def scan_bin(
         status=ShippingBinStatus.Open
     )
     session.add(new_bin)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        # Another scan made this barcode active since the check above
+        # (uq_shipping_bins_active_barcode)
+        session.rollback()
+        other = _active_bin(session, barcode)
+        raise ValidationException(
+            detail=f"Bin {barcode} is currently active in Job {other.shipping_job_id if other else 'another job'}"
+        )
     session.refresh(new_bin)
 
     log_audit_event(

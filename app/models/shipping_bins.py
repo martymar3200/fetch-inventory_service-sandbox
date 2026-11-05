@@ -75,6 +75,11 @@ class ShippingBin(Base):
     # Composite Index for Auto-Clear Logic
     __table_args__ = (
         Index("idx_shipping_bin_barcode_uncleared", "barcode", "cleared_dt"),
+        # One active (uncleared) bin per barcode, even if two scans race
+        Index(
+            "uq_shipping_bins_active_barcode", "barcode",
+            unique=True, postgresql_where=sa.text("cleared_dt IS NULL"),
+        ),
     )
 
 

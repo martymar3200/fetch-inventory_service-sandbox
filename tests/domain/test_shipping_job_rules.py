@@ -641,3 +641,50 @@ def test_list_queries_do_not_grow_with_job_size(shipper, session, warehouse):
     queries_for_list(small)  # warm up the connection
 
     assert queries_for_list(big) == queries_for_list(small)
+
+
+# --- Item 13: one active bin per barcode, even when two scans race ---
+
+def test_database_refuses_a_second_active_bin_with_the_same_barcode(shipper, session):
+    from sqlalchemy.exc import IntegrityError
+    barcode = _bin_barcode()
+    first_job, second_job = _new_job(shipper), _new_job(shipper)
+    session.add(ShippingBin(shipping_job_id=first_job, barcode=barcode))
+    session.commit()
+
+    session.add(ShippingBin(shipping_job_id=second_job, barcode=barcode))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+    # a cleared bin doesn't count
+    old = session.scalars(select(ShippingBin).where(ShippingBin.barcode == barcode)).one()
+    old.cleared_dt = datetime.now(timezone.utc)
+    session.commit()
+    session.add(ShippingBin(shipping_job_id=second_job, barcode=barcode))
+    session.commit()
+
+
+def test_bin_scan_that_loses_a_race_gets_a_clear_message(shipper, session, monkeypatch):
+    import app.routers.shipping_jobs as shipping_routes
+    barcode = _bin_barcode()
+    winner_job = _new_job(shipper)
+    session.add(ShippingBin(shipping_job_id=winner_job, barcode=barcode))
+    session.commit()
+    real_lookup = shipping_routes._active_bin
+    calls = []
+
+    def lookup_misses_once(session, barcode):
+        # the first check runs before the other scan's bin was saved
+        calls.append(barcode)
+        return None if len(calls) == 1 else real_lookup(session, barcode)
+
+    monkeypatch.setattr(shipping_routes, "_active_bin", lookup_misses_once)
+    loser_job = _new_job(shipper)
+
+    response = _scan_bin(shipper, loser_job, barcode)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"Bin {barcode} is currently active in Job {winner_job}"
+    session.expire_all()
+    assert session.scalars(select(ShippingBin).where(ShippingBin.shipping_job_id == loser_job)).all() == []
