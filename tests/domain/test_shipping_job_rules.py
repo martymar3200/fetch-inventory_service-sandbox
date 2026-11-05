@@ -571,3 +571,73 @@ def test_loading_an_item_does_not_load_its_shipping_bin(shipper, session, wareho
         assert "shipping_bin" not in loaded.__dict__
         # still there when asked for
         assert loaded.shipping_bin.id == bin_id
+
+
+# --- Item 8: the job list sends counts, not every bin and item ---
+
+def _list_row(client, job_id):
+    response = client.get("/shipping-jobs/", params={"workflow_id": job_id, "status": ["Running", "Completed"]})
+    assert response.status_code == 200, response.text
+    [row] = response.json()["items"]
+    return row
+
+
+def test_list_rows_have_counts_and_no_bins(shipper, session, warehouse):
+    location = _location(session)
+    job_id = _new_job(shipper)
+    bin_id = _scan_bin(shipper, job_id).json()["id"]
+    _scan_bin(shipper, job_id)
+    for _ in range(2):
+        assert _scan_item(shipper, job_id, bin_id, _ready_item(session, warehouse, location)).status_code == 200
+
+    row = _list_row(shipper, job_id)
+
+    assert "bins" not in row
+    assert row["bin_count"] == 2
+    assert row["total_items"] == 2
+    assert row["status"] == "Running"
+    assert row["assigned_user"]["id"] is not None
+
+
+def test_completed_job_counts_what_it_shipped(shipper, session, warehouse):
+    job_id, bin_id, item = _completed_job(shipper, session, warehouse)
+    assert shipper.post(
+        "/shipping-jobs/bins/clear", params={"barcode": _bin_barcode_of(session, bin_id)}
+    ).status_code == 200
+    record = session.get(Item, item.id)
+    record.shipping_bin_id = None  # as a refile does
+    session.commit()
+
+    row = _list_row(shipper, job_id)
+
+    assert row["bin_count"] == 1
+    assert row["total_items"] == 1
+    assert row["run_time"] is not None
+
+
+def test_list_queries_do_not_grow_with_job_size(shipper, session, warehouse):
+    from sqlalchemy import event
+    from tests.conftest import engine
+
+    def queries_for_list(job_id):
+        statements = []
+        listener = lambda *args, **kwargs: statements.append(1)  # noqa: E731
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            _list_row(shipper, job_id)
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+        return len(statements)
+
+    location = _location(session)
+    small = _new_job(shipper)
+    small_bin = _scan_bin(shipper, small).json()["id"]
+    assert _scan_item(shipper, small, small_bin, _ready_item(session, warehouse, location)).status_code == 200
+    big = _new_job(shipper)
+    for _ in range(3):
+        big_bin = _scan_bin(shipper, big).json()["id"]
+        for _ in range(3):
+            assert _scan_item(shipper, big, big_bin, _ready_item(session, warehouse, location)).status_code == 200
+    queries_for_list(small)  # warm up the connection
+
+    assert queries_for_list(big) == queries_for_list(small)

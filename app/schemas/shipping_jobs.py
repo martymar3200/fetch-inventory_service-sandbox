@@ -117,7 +117,30 @@ class ShippingJobOutput(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-class ShippingJobListOutput(ShippingJobOutput):
-    # Simplified output for lists if needed, but for now reuse detail
-    # We might exclude nested items in lists for performance, but stick to simple for now
-    pass
+class ShippingJobListOutput(BaseModel):
+    """
+    A dashboard row: the job and its counts, without bins or items (the detail
+    route has those). bin_count and total_items are filled in by the list route.
+    """
+    id: int
+    status: str
+    assigned_user_id: Optional[int] = None
+    assigned_user: Optional[UserDetailReadOutput] = None
+    created_by_id: Optional[int] = None
+    created_by: Optional[UserDetailReadOutput] = None
+
+    create_dt: datetime
+    update_dt: datetime
+    completed_dt: Optional[datetime] = None
+    last_transition: Optional[datetime] = None
+    run_time: Optional[str] = None
+
+    bin_count: int = 0
+    total_items: int = 0
+
+    @field_validator("run_time", mode="before")
+    @classmethod
+    def format_run_time(cls, v):
+        return ShippingJobOutput.format_run_time(v)
+
+    model_config = ConfigDict(from_attributes=True)

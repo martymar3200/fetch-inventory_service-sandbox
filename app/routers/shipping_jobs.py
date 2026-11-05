@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import paginate
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, lazyload
 from sqlalchemy import select, func, update, delete
 from sqlalchemy.exc import IntegrityError
 
@@ -166,7 +166,9 @@ def get_shipping_job_list(
     """
     query = select(ShippingJob).options(
         selectinload(ShippingJob.assigned_user),
-        selectinload(ShippingJob.created_by)
+        selectinload(ShippingJob.created_by),
+        # rows show counts only; don't load every bin and item (bins are "selectin")
+        lazyload(ShippingJob.bins),
     )
 
     if params.assigned_user_id:
@@ -192,7 +194,49 @@ def get_shipping_job_list(
     # Tie-breaker so pages never repeat or skip a job
     query = query.order_by(ShippingJob.id.desc())
 
-    return paginate(session, query)
+    return paginate(session, query, transformer=lambda jobs: _list_rows(session, jobs))
+
+
+def _count_by_job(session: Session, query) -> dict:
+    return {job_id: count for job_id, count in session.execute(query).all()}
+
+
+def _list_rows(session: Session, jobs: list) -> list:
+    """
+    Dashboard rows with bin and item counts from a few grouped queries for the
+    whole page. A Completed job counts what it shipped (shipping_bin_contents),
+    as its manifest does; an open job counts what is in its bins now.
+    """
+    ids = [job.id for job in jobs]
+    if not ids:
+        return []
+
+    def per_job(count_column, *joins):
+        query = select(ShippingBin.shipping_job_id, func.count(count_column)).select_from(ShippingBin)
+        for target, on in joins:
+            query = query.join(target, on)
+        return _count_by_job(
+            session, query.where(ShippingBin.shipping_job_id.in_(ids)).group_by(ShippingBin.shipping_job_id)
+        )
+
+    bins = per_job(ShippingBin.id)
+    live_items = per_job(Item.id, (Item, Item.shipping_bin_id == ShippingBin.id))
+    live_non_tray = per_job(NonTrayItem.id, (NonTrayItem, NonTrayItem.shipping_bin_id == ShippingBin.id))
+    shipped = per_job(
+        ShippingBinContent.id, (ShippingBinContent, ShippingBinContent.shipping_bin_id == ShippingBin.id)
+    )
+
+    rows = []
+    for job in jobs:
+        row = ShippingJobListOutput.model_validate(job, from_attributes=True)
+        row.bin_count = bins.get(job.id, 0)
+        row.total_items = (
+            shipped.get(job.id, 0)
+            if job.status == ShippingJobStatus.Completed
+            else live_items.get(job.id, 0) + live_non_tray.get(job.id, 0)
+        )
+        rows.append(row)
+    return rows
 
 @router.post("/", response_model=ShippingJobOutput, status_code=201, dependencies=[Depends(RequiresPermission("create_shipping_jobs"))])
 def create_shipping_job(
